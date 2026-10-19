@@ -8,6 +8,9 @@ use crate::api::{Error, ErrorCode};
 use crate::config::Limits;
 use crate::context::RequestContext;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) struct ExtractedPage {
     pub title: Option<String>,
     pub text: String,

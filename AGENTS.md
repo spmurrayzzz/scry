@@ -20,7 +20,11 @@ The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, 
 - `src/mcp.rs`: shared MCP handler, tool schemas, and HTTP session management.
 - `src/stdio.rs`: bounded stdio MCP transport and shutdown handling.
 - `src/main.rs`: CLI, runtime lifecycle, and exit codes.
-- `tests/duckduckgo_live.rs`: opt-in live probe. It uses its own client, not the service path.
+- `src/*/tests.rs`: module tests for parser, retrieval, policy, and service boundaries.
+- `tests/library.rs`: public library contracts.
+- `tests/interfaces.rs`: real CLI, REST, and MCP process tests.
+- `tests/support/`: shared process and transport helpers.
+- `tests/duckduckgo_live.rs`: ignored, opt-in probe through production `Scry::search` and `Scry::contents`, with one query and one returned page.
 
 ## Agent contract
 
@@ -176,7 +180,11 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The live DuckDuckGo probe is opt-in:
+The default suite covers public contracts, real interface processes, and module boundaries. It must not depend on the public web.
+
+Assert actual behavior and semantic output. Do not generate expected output with the system under test. Use small inline HTML to isolate parser rules. These fixtures do not establish compatibility with the live provider. Do not fake upstream success or relax security policy for tests.
+
+The live DuckDuckGo probe stays ignored unless explicitly requested:
 
 ```sh
 cargo test --test duckduckgo_live -- --ignored --nocapture

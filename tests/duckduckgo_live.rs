@@ -1,110 +1,90 @@
-use std::error::Error;
-use std::io::Read;
-use std::time::{Duration, Instant};
+use pulldown_cmark::{Event, Parser};
+use scry::{Config, ContentOrigin, ContentsRequest, ItemStatus, Scry, SearchRequest};
+use url::Url;
 
-use reqwest::blocking::Client;
-use reqwest::{StatusCode, Url, redirect};
-use scraper::{ElementRef, Html, Selector};
-
-fn text(element: ElementRef<'_>) -> String {
-    element
-        .text()
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[test]
-#[ignore = "makes one live request to DuckDuckGo"]
-fn duckduckgo_returns_search_results() -> Result<(), Box<dyn Error>> {
-    let endpoint = Url::parse("https://html.duckduckgo.com/html/")?;
-    let client = Client::builder()
-        .user_agent(concat!(
-            "scry/",
-            env!("CARGO_PKG_VERSION"),
-            " (search test)"
-        ))
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .redirect(redirect::Policy::none())
-        .no_proxy()
-        .build()?;
-
-    let started = Instant::now();
-    let response = client
-        .post(endpoint.clone())
-        .header("Accept", "text/html")
-        .header("Accept-Encoding", "identity")
-        .form(&[
-            ("q", "reqwest ClientBuilder documentation"),
-            ("kl", "us-en"),
-            ("b", ""),
-        ])
-        .send()?;
-    let status = response.status();
-    let max_bytes = 2 * 1024 * 1024;
-    let mut body = Vec::new();
-    response.take(max_bytes + 1).read_to_end(&mut body)?;
-    assert!(body.len() as u64 <= max_bytes, "response exceeds 2 MiB");
-    println!(
-        "DuckDuckGo: HTTP {status}, {} bytes, {:?}",
-        body.len(),
-        started.elapsed()
-    );
-
-    let html = String::from_utf8(body)?;
-    let document = Html::parse_document(&html);
-    let challenge = Selector::parse("#challenge-form, .anomaly-modal, form[action*='anomaly.js']")?;
+#[tokio::test]
+#[ignore = "makes one production DuckDuckGo search and reads one returned documentation page"]
+async fn production_search_and_contents_return_useful_reqwest_client_builder_documentation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scry = Scry::new(Config::default())?;
+    let search = scry
+        .search(SearchRequest {
+            query: "reqwest ClientBuilder documentation".into(),
+            include_domains: vec!["docs.rs".into()],
+            ..SearchRequest::default()
+        })
+        .await?;
+    let source = search
+        .results
+        .iter()
+        .find(|result| {
+            Url::parse(&result.url).is_ok_and(|url| {
+                url.host_str() == Some("docs.rs")
+                    && url.path().contains("/reqwest/")
+                    && url.path().ends_with("/struct.ClientBuilder.html")
+            })
+        })
+        .expect("production search did not return reqwest ClientBuilder documentation");
+    assert_eq!(source.status, ItemStatus::Ok);
+    assert!(source.error.is_none());
+    assert_eq!(source.id, source.url);
+    assert!(Url::parse(&source.id)?.fragment().is_none());
     assert!(
-        document.select(&challenge).next().is_none(),
-        "DuckDuckGo returned a bot challenge (HTTP {status})"
+        source
+            .title
+            .as_deref()
+            .is_some_and(|title| title.contains("ClientBuilder"))
     );
-    assert_eq!(status, StatusCode::OK, "DuckDuckGo did not return HTTP 200");
-
-    let items = Selector::parse(".result:not(.result--ad)")?;
-    let links = Selector::parse("a.result__a")?;
-    let snippets = Selector::parse(".result__snippet")?;
-    let mut results = Vec::new();
-
-    for item in document.select(&items) {
-        let Some(link) = item.select(&links).next() else {
-            continue;
-        };
-        let title = text(link);
-        let href = link.value().attr("href").ok_or("result has no URL")?;
-        let mut url = endpoint.join(href)?;
-        if matches!(
-            url.host_str(),
-            Some("duckduckgo.com" | "html.duckduckgo.com")
-        ) {
-            let target = url
-                .query_pairs()
-                .find(|(key, _)| key == "uddg")
-                .map(|(_, value)| value.into_owned())
-                .ok_or("DuckDuckGo result link has no destination")?;
-            url = Url::parse(&target)?;
-        }
-        let snippet = item.select(&snippets).next().map(text).unwrap_or_default();
-        assert!(!title.is_empty(), "result has no title");
-        assert!(!snippet.is_empty(), "result has no snippet: {url}");
-        assert!(matches!(url.scheme(), "http" | "https"));
-        assert!(url.host_str().is_some());
-        assert!(url.username().is_empty() && url.password().is_none());
-        results.push((title, url, snippet));
-        if results.len() == 5 {
-            break;
-        }
-    }
-
-    for (index, (title, url, snippet)) in results.iter().enumerate() {
-        println!("\n{}. {title}\n{url}\n{snippet}", index + 1);
-    }
-    assert!(!results.is_empty(), "no parseable search results returned");
+    assert_ne!(source.content_origin, Some(ContentOrigin::Live));
+    assert!(source.text.is_none());
+    assert!(source.final_url.is_none());
+    let contents = scry
+        .contents(ContentsRequest {
+            ids: vec![source.id.clone()],
+            ..ContentsRequest::default()
+        })
+        .await?;
+    assert_eq!(contents.results.len(), 1);
+    let page = &contents.results[0];
+    assert_eq!(page.status, ItemStatus::Ok, "{page:?}");
+    assert!(page.error.is_none());
+    assert_eq!(page.id, source.id);
+    assert_eq!(page.url, source.url);
+    assert_eq!(page.content_origin, Some(ContentOrigin::Live));
+    let final_url = Url::parse(
+        page.final_url
+            .as_deref()
+            .expect("live page has no final URL"),
+    )?;
+    assert_eq!(final_url.host_str(), Some("docs.rs"));
+    assert_eq!(final_url.scheme(), "https");
+    assert!(final_url.path().contains("/reqwest/"));
+    assert!(final_url.path().ends_with("/struct.ClientBuilder.html"));
+    let text = page
+        .text
+        .as_deref()
+        .expect("live page has no extracted text");
+    let visible = Parser::new(text)
+        .filter_map(|event| match event {
+            Event::Text(text) | Event::Code(text) => Some(text.into_string()),
+            Event::SoftBreak | Event::HardBreak => Some(" ".to_owned()),
+            _ => None,
+        })
+        .collect::<String>();
     assert!(
-        results.iter().any(
-            |(_, url, _)| url.host_str() == Some("docs.rs") && url.path().contains("/reqwest/")
-        ),
-        "no docs.rs/reqwest documentation found in the first five results"
+        visible
+            .split_whitespace()
+            .collect::<String>()
+            .contains("pubfnbuild(self)->Result<Client>"),
+        "documentation is missing the ClientBuilder::build signature: {page:?}"
+    );
+    assert!(
+        visible
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Returns a Client that uses this ClientBuilder configuration."),
+        "documentation is missing the ClientBuilder::build explanation: {page:?}"
     );
     Ok(())
 }

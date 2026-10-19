@@ -6,6 +6,9 @@ use url::{Host, Url};
 use crate::api::{Error, ErrorCode};
 use crate::config::Limits;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Default)]
 pub(crate) struct DomainFilter {
     include: Vec<String>,

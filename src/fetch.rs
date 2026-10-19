@@ -21,6 +21,9 @@ use crate::config::Limits;
 use crate::context::RequestContext;
 use crate::policy::{DomainFilter, parse_url, validate_ip};
 
+#[cfg(test)]
+mod tests;
+
 const MAX_DNS_ANSWERS: usize = 64;
 const MAX_CHARSET_SNIFF_BYTES: usize = 1024;
 

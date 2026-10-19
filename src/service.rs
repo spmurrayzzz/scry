@@ -21,6 +21,9 @@ use crate::extract;
 use crate::fetch::Fetcher;
 use crate::policy::{self, DomainFilter};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone)]
 pub struct Scry {
     inner: Arc<Shared>,

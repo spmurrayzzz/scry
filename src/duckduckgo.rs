@@ -7,6 +7,9 @@ use crate::config::Limits;
 use crate::context::RequestContext;
 use crate::extract::{bounded_plain_text, challenge_screen, parse, plain_text, safe_url};
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) struct DiscoveredResult {
     pub url: Url,
     pub title: String,
