@@ -71,7 +71,8 @@ scry mcp
 ```
 
 - `--timeout SECONDS` is global. Use 1 to 300 seconds. It sets the request deadline, not the stdio write deadline.
-- `search` and `contents` write results to stdout as JSON. CLI errors go to stderr as an `ErrorResponse`.
+- `search` and `contents` write plain text to stdout by default. Operation errors and warnings go to stderr.
+- `--json` is global. It selects JSON results on stdout and `ErrorResponse` operation errors on stderr. Warnings stay in the JSON response. Argument errors, help, and version output always use plain text. MCP stdout always uses JSON-RPC.
 - Search and contents exit codes: 0 for success, 1 for failure (including all items failed), 2 for partial results or invalid/unsupported arguments, and 130 for an interrupt.
 - Orderly shutdown of `serve` or `mcp` exits successfully. Transport failures use stderr diagnostics and a nonzero exit code.
 
@@ -101,7 +102,7 @@ scry mcp
 - Input frames are limited by `max_request_bytes`, which defaults to 64 KiB. Malformed, invalid UTF-8, and oversized frames stop the transport.
 - At most 32 request IDs and 32 notifications can be pending. Duplicate active or cancelled request IDs are rejected.
 - Completed requests release their ID slots. Cancelled IDs retain a slot until process exit.
-- Every stdout send has a 10-second deadline, including initialization responses. A timeout cancels the session and reports `timeout` on stderr.
+- Every stdout send has a 10-second deadline, including initialization responses. A timeout cancels the session and reports a diagnostic on stderr.
 - EOF, SIGINT, and SIGTERM stop the server. After cancellation, session cleanup allows one second and runtime shutdown allows 250 ms.
 - Do not remove the bounded runtime shutdown. Tokio stdio workers can remain blocked when the client leaves a pipe open.
 

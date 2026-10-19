@@ -16,9 +16,15 @@ use tokio_util::sync::CancellationToken;
     name = "scry",
     version,
     about = "Search the web and read public HTML pages",
-    after_help = "Output: JSON on stdout, structured errors on stderr. Exit codes: 0 success, 1 failure (including all URLs failed), 2 partial results or invalid/unsupported arguments, 130 interrupted. DuckDuckGo access is unofficial and can fail or be blocked."
+    after_help = "Output: plain text by default. Use --json for structured results and operation errors. Argument errors use plain text on stderr. Exit codes: 0 success, 1 failure (including all URLs failed), 2 partial results or invalid/unsupported arguments, 130 interrupted. DuckDuckGo access is unofficial and can fail or be blocked."
 )]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Write results and operation errors as JSON"
+    )]
+    json: bool,
     #[arg(
         long,
         global = true,
@@ -96,26 +102,20 @@ struct ServeArgs {
 }
 
 fn main() -> ExitCode {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(error) if !error.use_stderr() => {
-            return match error.print() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(_) => fail(
-                    Error::new(ErrorCode::Internal, "Cannot write help output"),
-                    1,
-                ),
-            };
-        }
-        Err(error) => return fail(Error::new(ErrorCode::InvalidInput, error.to_string()), 2),
-    };
+    let cli = Cli::parse();
     let stdio = matches!(cli.command, Command::Mcp);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
-        Err(_) => return fail(Error::new(ErrorCode::Internal, "Cannot start runtime"), 1),
+        Err(_) => {
+            return fail(
+                Error::new(ErrorCode::Internal, "Cannot start runtime"),
+                1,
+                cli.json,
+            );
+        }
     };
     let result = runtime.block_on(run(cli));
     if stdio {
@@ -131,7 +131,7 @@ async fn run(cli: Cli) -> ExitCode {
     }
     let service = match Scry::new(config) {
         Ok(service) => service,
-        Err(error) => return fail(error, 1),
+        Err(error) => return fail(error, 1, cli.json),
     };
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
@@ -185,7 +185,7 @@ async fn run(cli: Cli) -> ExitCode {
     };
     signal_task.abort();
     if let Ok(Err(error)) = signal_task.await {
-        return fail(error, 1);
+        return fail(error, 1, cli.json);
     }
     match result {
         Ok(Some(response)) => {
@@ -205,11 +205,21 @@ async fn run(cli: Cli) -> ExitCode {
             } else {
                 0
             };
-            match write_json(std::io::stdout().lock(), &response) {
+            let output = if cli.json {
+                write_json(std::io::stdout().lock(), &response)
+            } else {
+                write_text(
+                    std::io::stdout().lock(),
+                    std::io::stderr().lock(),
+                    &response,
+                )
+            };
+            match output {
                 Ok(()) => ExitCode::from(code),
                 Err(_) => fail(
-                    Error::new(ErrorCode::Internal, "Cannot write JSON output"),
+                    Error::new(ErrorCode::Internal, "Cannot write output"),
                     1,
+                    cli.json,
                 ),
             }
         }
@@ -220,7 +230,7 @@ async fn run(cli: Cli) -> ExitCode {
                 ErrorCode::InvalidInput | ErrorCode::Unsupported => 2,
                 _ => 1,
             };
-            fail(error, code)
+            fail(error, code, cli.json)
         }
     }
 }
@@ -252,8 +262,74 @@ fn write_json(mut writer: impl Write, value: &impl serde::Serialize) -> Result<(
     writer.flush()
 }
 
-fn fail(error: Error, code: u8) -> ExitCode {
-    let _ = write_json(std::io::stderr().lock(), &ErrorResponse { error });
+fn plain(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+fn write_text(
+    mut writer: impl Write,
+    mut diagnostics: impl Write,
+    response: &Response,
+) -> Result<(), std::io::Error> {
+    if response.results.is_empty() {
+        writeln!(writer, "No results found.")?;
+    }
+    for (index, item) in response.results.iter().enumerate() {
+        if index > 0 {
+            writeln!(writer)?;
+        }
+        if let Some(title) = &item.title {
+            writeln!(writer, "{}", plain(title))?;
+        }
+        writeln!(writer, "{}", plain(&item.url))?;
+        if let Some(url) = &item.final_url
+            && url != &item.url
+        {
+            writeln!(writer, "Final URL: {}", plain(url))?;
+        }
+        if let Some(snippet) = &item.snippet
+            && item.text.is_none()
+            && !item.highlights.contains(snippet)
+        {
+            writeln!(writer, "{}", plain(snippet))?;
+        }
+        for highlight in &item.highlights {
+            writeln!(writer, "Highlight: {}", plain(highlight))?;
+        }
+        if let Some(text) = &item.text {
+            writeln!(writer, "\n{}", plain(text))?;
+        }
+        if let Some(error) = &item.error {
+            write_error(&mut writer, error)?;
+        }
+        if item.truncated {
+            writeln!(writer, "Content truncated.")?;
+        }
+    }
+    writer.flush()?;
+    for warning in &response.warnings {
+        writeln!(diagnostics, "warning: {}", plain(warning))?;
+    }
+    diagnostics.flush()
+}
+
+fn write_error(mut writer: impl Write, error: &Error) -> Result<(), std::io::Error> {
+    writeln!(writer, "error: {}", plain(&error.message))?;
+    if let Some(seconds) = error.retry_after_secs {
+        writeln!(writer, "Retry after {seconds} seconds.")?;
+    }
+    writer.flush()
+}
+
+fn fail(error: Error, code: u8, json: bool) -> ExitCode {
+    if json {
+        let _ = write_json(std::io::stderr().lock(), &ErrorResponse { error });
+    } else {
+        let _ = write_error(std::io::stderr().lock(), &error);
+    }
     ExitCode::from(code)
 }
 

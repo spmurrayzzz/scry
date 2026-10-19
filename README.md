@@ -14,7 +14,7 @@ scry contents https://docs.rs/reqwest/latest/reqwest/
 scry serve
 ```
 
-Search and contents write JSON to stdout and errors to stderr. Exit codes: `0` success, `1` failure, `2` partial results or invalid/unsupported arguments, `130` interrupt.
+Search and contents write plain text to stdout by default. Use `--json` for structured results and operation errors. Errors go to stderr. Exit codes: `0` success, `1` failure, `2` partial results or invalid/unsupported arguments, `130` interrupt.
 
 ## MCP and HTTP
 

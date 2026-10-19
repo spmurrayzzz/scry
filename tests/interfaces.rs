@@ -98,7 +98,9 @@ fn assert_tools(result: &Value) {
 }
 
 async fn cli(args: &[&str], exit: i32, error: Option<&str>) -> Value {
-    let mut process = Process::spawn(args, None, true);
+    let mut command_args = vec!["--json"];
+    command_args.extend_from_slice(args);
+    let mut process = Process::spawn(&command_args, None, true);
     process.input.take();
     assert_eq!(process.wait(8).await.code(), Some(exit), "{args:?}");
     let errors = process.remaining_errors();
@@ -163,7 +165,7 @@ async fn cli_metadata_success_partial_and_all_failed_exit_codes() {
 }
 
 #[tokio::test]
-async fn cli_invalid_search_is_structured_stderr_without_provider_calls() {
+async fn cli_invalid_search_uses_json_only_for_operation_errors() {
     cli(
         &["search", "unused", "--type", "neural"],
         2,
@@ -172,12 +174,17 @@ async fn cli_invalid_search_is_structured_stderr_without_provider_calls() {
     .await;
     cli(&["search", ""], 2, Some("invalid_input")).await;
     cli(&["search", &"x".repeat(500)], 2, Some("invalid_input")).await;
-    cli(
-        &["search", "unused", "--num-results", "0"],
-        2,
-        Some("invalid_input"),
-    )
-    .await;
+    let mut process = Process::spawn(
+        &["--json", "search", "unused", "--num-results", "0"],
+        None,
+        true,
+    );
+    process.input.take();
+    assert_eq!(process.wait(8).await.code(), Some(2));
+    let errors = String::from_utf8(process.remaining_errors()).unwrap();
+    assert!(errors.starts_with("error: invalid value '0'"), "{errors}");
+    assert!(errors.contains("--help"), "{errors}");
+    assert!(process.output.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -223,17 +230,20 @@ async fn stdio_raw_protocol_tools_contents_errors_and_clean_eof() {
 
 #[tokio::test]
 async fn stdio_rejects_malformed_utf8_and_oversized_frames() {
-    for (frame, code) in [
-        (b"{broken}\n".to_vec(), "invalid_input"),
-        (vec![0xff, b'\n'], "invalid_input"),
-        (vec![b'x'; 65538], "too_large"),
+    for (frame, message) in [
+        (b"{broken}\n".to_vec(), "Malformed MCP input frame"),
+        (vec![0xff, b'\n'], "Cannot read a UTF-8 MCP input frame"),
+        (
+            vec![b'x'; 65538],
+            "MCP input frame exceeds max_request_bytes",
+        ),
     ] {
         let mut process = stdio().await;
         process.input.as_ref().unwrap().send(frame).unwrap();
         assert!(!process.wait(8).await.success());
-        assert_error(
-            &serde_json::from_slice(&process.remaining_errors()).unwrap(),
-            code,
+        assert_eq!(
+            String::from_utf8(process.remaining_errors()).unwrap(),
+            format!("error: {message}\n"),
         );
         assert!(process.output.try_recv().is_err());
     }
@@ -275,13 +285,9 @@ async fn stdio_unread_os_pipe_times_out_during_preinitialization_pings() {
         start.elapsed() >= Duration::from_secs(10),
         "did not exercise the production write deadline"
     );
-    let error: Value = serde_json::from_slice(&process.remaining_errors()).unwrap();
-    assert_error(&error, "timeout");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("stdout")
+    assert_eq!(
+        String::from_utf8(process.remaining_errors()).unwrap(),
+        "error: MCP stdout write deadline exceeded (10 seconds)\n",
     );
 }
 
