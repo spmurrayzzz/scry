@@ -1,6 +1,8 @@
 pub mod api;
 pub mod config;
 pub mod context;
+pub mod duckduckgo;
+pub mod extract;
 pub mod fetch;
 pub mod policy;
 
