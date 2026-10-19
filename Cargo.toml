@@ -4,6 +4,25 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+encoding_rs = "0.8"
+futures-util = "0.3"
+hickory-resolver = "0.26"
+html5gum = "0.8.4"
+httpdate = "1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+ipnet = "2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "form", "stream"] }
+rmcp = { version = "=3.5.1", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util", "io-std"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+url = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "rustls"] }
