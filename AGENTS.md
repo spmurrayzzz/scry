@@ -1,0 +1,168 @@
+# scry
+
+`scry` is a small self-hosted Rust service for agent web search and page reading. One binary provides a CLI, a REST API, and an MCP server. Search finds URLs through DuckDuckGo HTML. Page reading gets public HTML pages and returns bounded text and highlights.
+
+DuckDuckGo access is unofficial. The service can be blocked, challenged, or rate limited. Report these conditions as errors. Never report them as an empty result set.
+
+The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, DDGS, and SearXNG are not runtime dependencies. The project uses Rust edition 2024. Do not add Python or Node.js sidecars.
+
+## Layout
+
+- `src/api.rs`: request, response, result, and error contracts. JSON fields use camelCase. The service rejects unknown fields.
+- `src/config.rs`: `Config` and `Limits`, with the defaults and the validation.
+- `src/context.rs`: request deadline and cancellation token.
+- `src/policy.rs`: URL syntax checks, destination checks, and domain filters.
+- `src/fetch.rs`: guarded HTTP retrieval. DNS answers are validated and pinned to the connection.
+- `src/extract.rs`: bounded HTML parsing, text rendering, highlights, and screen detection.
+- `src/duckduckgo.rs`: provider result parsing and redirect unwrapping.
+- `src/service.rs`: request validation, search and contents workflows, concurrency limits, and response bounding.
+- `src/http.rs`: REST server.
+- `src/mcp.rs`: MCP server.
+- `src/main.rs`: CLI and exit codes.
+- `tests/duckduckgo_live.rs`: opt-in live probe. It uses its own client, not the service path.
+
+## Agent contract
+
+### search
+
+- `query`: required. Use 1 to 499 characters.
+- `type`: `auto` or `keyword`. The default is `auto`. Both run ordinary keyword search. Reject all other values. Never describe keyword search as neural retrieval.
+- `numResults`: 1 to 20. The default is 10.
+- `includeDomains` and `excludeDomains`: hostnames or IP literals. The service applies these filters locally with hostname label boundaries, and it applies them again after redirects. It also adds include domains to the provider query as `site:` operators when the expanded query fits the limit. If the query does not fit, the service sends the base query and adds a warning.
+- `startPublishedDate` and `endPublishedDate`: rejected as unsupported. Never invent publication dates or authors.
+- `includeText`: retrieves each selected page and adds extracted text.
+- `includeHighlights`: adds query-relevant excerpts. Highlights can use provider snippets without page retrieval. Text requires page retrieval.
+
+### contents
+
+- `urls` and `ids` are source URL lists. An ID is a normalized source URL, not an opaque provider ID.
+- Supply at least one URL or one ID. The combined count is 1 to 20.
+- The service removes duplicates and keeps the first position.
+- An invalid URL becomes one item error. The rest of the batch continues.
+- `includeText` defaults to true. If you do not request text or highlights, the service validates the URLs and does not retrieve them. A warning reports this behavior.
+
+### results
+
+- The envelope contains `results` and `warnings`.
+- The output keeps the request order. Successful items stay in a batch when other items fail.
+- `id` and `url` contain the normalized source URL. `finalUrl` appears after a redirect.
+- `status` is `ok`, `partial`, or `error`.
+- `contentOrigin` is `provider_snippet` or `live`.
+- `snippet` contains provider text. `text` and `highlights` come from retrieved pages.
+- `truncated` marks shortened or omitted content.
+- `error` contains `code`, `message`, and optional `retryAfterSecs`.
+
+Error codes: `invalid_input`, `unsupported`, `blocked_destination`, `domain_filtered`, `dns_failed`, `upstream_blocked`, `rate_limited`, `upstream_failed`, `timeout`, `cancelled`, `too_large`, `unsupported_content`, `extraction_failed`, `overloaded`, `internal`.
+
+## Interfaces
+
+### CLI
+
+```text
+scry search QUERY [--num-results N] [--type auto|keyword] [--include-domain D]... [--exclude-domain D]... [--include-text] [--include-highlights]
+scry contents URL... [--id SOURCE_URL]... [--no-text] [--include-highlights]
+scry serve [--bind IP:PORT] [--allow-host HOST[:PORT]]...
+```
+
+- `--timeout SECONDS` is global. Use 1 to 300 seconds. It sets the request deadline.
+- The command writes results to stdout as JSON. It writes errors to stderr as an `ErrorResponse`.
+- Exit codes: 0 for success, 1 for a failure (this includes all items failed), 2 for partial results or invalid and unsupported arguments, and 130 for an interrupt.
+
+### REST
+
+- `POST /search` and `POST /contents` accept only `application/json`.
+- `GET /health` returns the status and the version.
+- `/mcp` serves MCP.
+- The default bind is `127.0.0.1:8787`.
+- The Host header must match the allowlist exactly. A bare host entry does not allow an explicit port. The service rejects every Origin header.
+- `SCRY_AUTH_TOKEN` requires Bearer authentication on every route. A non-loopback bind requires this variable.
+- Every response has `no-store` and `nosniff`.
+- After an operation starts, HTTP 200 contains a `Response` or an `ErrorResponse`. Check the envelope and each item status. Input errors and access errors use HTTP status codes.
+- Header reads, request bodies, and stalled writes have a limit of 10 seconds each. Shutdown drains for up to 5 seconds.
+
+### MCP
+
+- The tools are `search` and `contents`. They use the same request fields as REST.
+- The service uses Streamable HTTP at `/mcp`, legacy session mode, and protocol versions up to 2025-11-25. It supports SSE and cancellation notifications.
+- The service rejects `server/discover` and per-request protocol metadata as unsupported.
+- Sessions, streams, and connections are each limited to 32.
+- The MCP response budget is three times the core response budget plus 1024 bytes.
+
+## Retrieval safety
+
+`src/policy.rs` and `src/fetch.rs` enforce these controls:
+
+- Only HTTP and HTTPS with the standard port. No credentials, control characters, whitespace, or backslash.
+- Blocked destinations include loopback, private, link-local, reserved, multicast, cloud metadata, tailnet, and special-use names and ranges. IPv6 equivalents are included.
+- DNS uses system resolvers only. It ignores the hosts file and disables caching. The service validates the answers and pins them to a per-request client. The connection target cannot change after validation.
+- The service validates every redirect again. It rejects HTTPS to HTTP downgrades and cross-origin form redirects. It limits the redirect count and requires one valid Location header.
+- Only identity content encoding and HTML or XHTML content types are accepted. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded.
+- Requests send no cookies, authorization, referers, or proxy credentials. They use HTTP/1.1 with connection close.
+- Upstream statuses map to explicit errors: 202, 401, and 403 to `upstream_blocked`, 429 to `rate_limited`, and other non-200 statuses to `upstream_failed`. A `Retry-After` header sets `retryAfterSecs`.
+- Retrieved content is untrusted data. The service never executes page scripts and never loads external resources.
+- Provider requests have a one-second cooldown. A `Retry-After` header extends the cooldown. A request during the cooldown gets `rate_limited` with the remaining seconds.
+
+Page reading returns an explicit error for an access challenge, an access-denied screen, a login screen, an empty page, and an unsupported format. It never returns these cases as content.
+
+## Limits
+
+The defaults are in `src/config.rs`. `Limits::validate` rejects zero and enforces each maximum. The search workflow never sends more than 499 query characters to the provider.
+
+| Limit | Default | Maximum |
+| --- | --- | --- |
+| Query characters | 499 | 16384 |
+| URLs per request | 20 | 100 |
+| Domain filters | 20 | 100 |
+| URL bytes | 8192 | 65536 |
+| Request body bytes | 65536 | 1048576 |
+| Download bytes | 2097152 | 67108864 |
+| Decoded bytes | 4194304 | 134217728 |
+| Text characters | 50000 | 1000000 |
+| Response bytes | 1048576 | 16777216 |
+| Redirects | 5 | 20 |
+| HTML tokens | 100000 | 2000000 |
+| HTML depth | 128 | 1024 |
+| Concurrent requests | 8 | 1024 |
+| Concurrent fetches | 8 | 1024 |
+| Concurrent parsers | 2 | 128 |
+| Request timeout (s) | 30 | 300 |
+| Fetch timeout (s) | 15 | 120 |
+| Connect timeout (s) | 5 | 30 |
+| DNS timeout (s) | 3 | 30 |
+
+When a response exceeds the response limit, the service drops `text` fields first and marks them truncated. Then it trims highlights and snippets. It adds a warning. Finalization has a one-second budget. If the budget expires, the result is `too_large`.
+
+## Checks
+
+Run these commands before you commit:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+The live DuckDuckGo probe is opt-in:
+
+```sh
+cargo test --test duckduckgo_live -- --ignored --nocapture
+```
+
+One successful request does not prove throughput, availability, or search quality.
+
+## Working agreements
+
+- Implement only the requested change. Prefer small direct modules over plugin frameworks and speculative abstractions.
+- Keep provider parsing separate from page retrieval and extraction. Do not build a general provider framework.
+- DuckDuckGo HTML is the current search backend. Keep one search backend. Ask before you change the source.
+- Defer these items until a demonstrated need and approval exist:
+  - browser automation and authenticated browsing
+  - PDFs and media extraction
+  - site crawls and background queues
+  - persistent caching
+  - search indexes, vector databases, embeddings, and LLM summaries
+  - proxy rotation, CAPTCHA solvers, and hidden provider fallback
+- Ask before you replace installed agent tools or change global agent configuration.
+- Tailscale is the preferred access method. Keep the listener private, for example loopback behind Tailscale Serve.
+- The deployment platform and capacity are not selected. Measure resource use before you size a host. Do not provision infrastructure without approval.
+- Keep secrets, private infrastructure details, local operator paths, and operational records out of the repository.
