@@ -186,6 +186,7 @@ One successful request does not prove throughput, availability, or search qualit
 
 ## Working agreements
 
+- Keep this AGENTS.md file up to date. It is the source of truth for the agent contract and the service design.
 - Implement only the requested change. Prefer small direct modules over plugin frameworks and speculative abstractions.
 - Keep provider parsing separate from page retrieval and extraction. Do not build a general provider framework.
 - DuckDuckGo HTML is the current search backend. Keep one search backend. Ask before you change the source.
