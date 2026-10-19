@@ -1,5 +1,6 @@
 mod http;
 mod mcp;
+mod stdio;
 
 use std::{io::Write, net::SocketAddr, process::ExitCode, time::Duration};
 
@@ -41,6 +42,11 @@ enum Command {
         after_help = "Routes: POST /search, POST /contents, GET /health, /mcp. Set SCRY_AUTH_TOKEN to require Bearer authentication on every route. A non-loopback bind requires this environment variable. Host values must match the allowlist exactly. A bare host does not allow any explicit port. Every Origin header is rejected. REST operations use body-owned futures so disconnects cancel work. Once a REST operation starts, HTTP 200 contains either a Response or an ErrorResponse {\"error\":{\"code\":...,\"message\":...}}. Check the envelope and each result status. Input and access errors use HTTP error codes. MCP supports GET/SSE and cancellation notifications through protocol 2025-11-25. Connections and MCP sessions are each limited to 32. Headers, request bodies, and stalled writes have 10-second limits. Shutdown allows a 5-second drain. Core JSON responses are limited to 1 MiB; MCP text plus structured content allows up to three times that budget plus 1024 bytes. Use a trusted reverse proxy for TLS."
     )]
     Serve(ServeArgs),
+    #[command(
+        about = "Serve MCP over stdin/stdout without an HTTP listener",
+        after_help = "Use command: scry, args: [\"mcp\"] in an MCP client. stdin and stdout carry MCP newline-delimited JSON-RPC only. Errors go to stderr. No listener or authentication token is required. Input frames are limited to 64 KiB. At most 32 request IDs and 32 notifications can be pending; cancelled IDs remain reserved until exit. EOF, Ctrl-C, and SIGTERM stop the server."
+    )]
+    Mcp,
 }
 
 #[derive(Args)]
@@ -89,8 +95,7 @@ struct ServeArgs {
     allow_hosts: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) if !error.use_stderr() => {
@@ -104,6 +109,22 @@ async fn main() -> ExitCode {
         }
         Err(error) => return fail(Error::new(ErrorCode::InvalidInput, error.to_string()), 2),
     };
+    let stdio = matches!(cli.command, Command::Mcp);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => return fail(Error::new(ErrorCode::Internal, "Cannot start runtime"), 1),
+    };
+    let result = runtime.block_on(run(cli));
+    if stdio {
+        runtime.shutdown_timeout(Duration::from_millis(250));
+    }
+    result
+}
+
+async fn run(cli: Cli) -> ExitCode {
     let mut config = Config::default();
     if let Some(timeout) = cli.timeout {
         config.limits.request_timeout_secs = timeout;
@@ -160,6 +181,7 @@ async fn main() -> ExitCode {
         Command::Serve(args) => http::serve(service, args.bind, args.allow_hosts, shutdown.clone())
             .await
             .map(|()| None),
+        Command::Mcp => stdio::serve(service, shutdown.clone()).await.map(|()| None),
     };
     signal_task.abort();
     if let Ok(Err(error)) = signal_task.await {

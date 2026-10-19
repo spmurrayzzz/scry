@@ -1,6 +1,6 @@
 # scry
 
-`scry` is a small self-hosted Rust service for agent web search and page reading. One binary provides a CLI, a REST API, and an MCP server. Search finds URLs through DuckDuckGo HTML. Page reading gets public HTML pages and returns bounded text and highlights.
+`scry` is a small self-hosted Rust service for agent web search and page reading. One binary provides a CLI, a REST API, and MCP over stdio or Streamable HTTP. Search finds URLs through DuckDuckGo HTML. Page reading gets public HTML pages and returns bounded text and highlights.
 
 DuckDuckGo access is unofficial. The service can be blocked, challenged, or rate limited. Report these conditions as errors. Never report them as an empty result set.
 
@@ -17,8 +17,9 @@ The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, 
 - `src/duckduckgo.rs`: provider result parsing and redirect unwrapping.
 - `src/service.rs`: request validation, search and contents workflows, concurrency limits, and response bounding.
 - `src/http.rs`: REST server.
-- `src/mcp.rs`: MCP server.
-- `src/main.rs`: CLI and exit codes.
+- `src/mcp.rs`: shared MCP handler, tool schemas, and HTTP session management.
+- `src/stdio.rs`: bounded stdio MCP transport and shutdown handling.
+- `src/main.rs`: CLI, runtime lifecycle, and exit codes.
 - `tests/duckduckgo_live.rs`: opt-in live probe. It uses its own client, not the service path.
 
 ## Agent contract
@@ -62,11 +63,13 @@ Error codes: `invalid_input`, `unsupported`, `blocked_destination`, `domain_filt
 scry search QUERY [--num-results N] [--type auto|keyword] [--include-domain D]... [--exclude-domain D]... [--include-text] [--include-highlights]
 scry contents URL... [--id SOURCE_URL]... [--no-text] [--include-highlights]
 scry serve [--bind IP:PORT] [--allow-host HOST[:PORT]]...
+scry mcp
 ```
 
-- `--timeout SECONDS` is global. Use 1 to 300 seconds. It sets the request deadline.
-- The command writes results to stdout as JSON. It writes errors to stderr as an `ErrorResponse`.
-- Exit codes: 0 for success, 1 for a failure (this includes all items failed), 2 for partial results or invalid and unsupported arguments, and 130 for an interrupt.
+- `--timeout SECONDS` is global. Use 1 to 300 seconds. It sets the request deadline, not the stdio write deadline.
+- `search` and `contents` write results to stdout as JSON. CLI errors go to stderr as an `ErrorResponse`.
+- Search and contents exit codes: 0 for success, 1 for failure (including all items failed), 2 for partial results or invalid/unsupported arguments, and 130 for an interrupt.
+- Orderly shutdown of `serve` or `mcp` exits successfully. Transport failures use stderr diagnostics and a nonzero exit code.
 
 ### REST
 
@@ -82,11 +85,42 @@ scry serve [--bind IP:PORT] [--allow-host HOST[:PORT]]...
 
 ### MCP
 
-- The tools are `search` and `contents`. They use the same request fields as REST.
-- The service uses Streamable HTTP at `/mcp`, legacy session mode, and protocol versions up to 2025-11-25. It supports SSE and cancellation notifications.
+- Both transports reuse the same `search` and `contents` handler and tool schemas. Request fields match REST.
+- Both support protocol versions up to 2025-11-25 and propagate cancellation to the shared service.
 - The service rejects `server/discover` and per-request protocol metadata as unsupported.
-- Sessions, streams, and connections are each limited to 32.
 - The MCP response budget is three times the core response budget plus 1024 bytes.
+
+#### Stdio
+
+- `scry mcp` exchanges newline-delimited JSON-RPC on stdin and stdout. It starts no HTTP listener and requires no authentication token.
+- Keep stdout exclusively for MCP messages. Send logs and transport diagnostics to stderr.
+- Input frames are limited by `max_request_bytes`, which defaults to 64 KiB. Malformed, invalid UTF-8, and oversized frames stop the transport.
+- At most 32 request IDs and 32 notifications can be pending. Duplicate active or cancelled request IDs are rejected.
+- Completed requests release their ID slots. Cancelled IDs retain a slot until process exit.
+- Every stdout send has a 10-second deadline, including initialization responses. A timeout cancels the session and reports `timeout` on stderr.
+- EOF, SIGINT, and SIGTERM stop the server. After cancellation, session cleanup allows one second and runtime shutdown allows 250 ms.
+- Do not remove the bounded runtime shutdown. Tokio stdio workers can remain blocked when the client leaves a pipe open.
+
+With `scry` on PATH, pi can launch it directly:
+
+```json
+{
+  "mcpServers": {
+    "scry": {
+      "command": "scry",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+An absolute executable path can replace `scry`. Do not put machine-specific paths in repository configuration.
+
+#### Streamable HTTP
+
+- `scry serve` exposes MCP at `/mcp` with legacy session mode, SSE responses, and cancellation notifications.
+- HTTP sessions, streams, and connections are each limited to 32.
+- HTTP Host, Origin, and authentication rules apply to this transport, not to stdio.
 
 ## Retrieval safety
 
