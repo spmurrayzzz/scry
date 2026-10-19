@@ -1,8 +1,12 @@
-use std::{io::Write, process::ExitCode, time::Duration};
+mod http;
+mod mcp;
+
+use std::{io::Write, net::SocketAddr, process::ExitCode, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
 use scry::{
-    Config, ContentsRequest, Error, ErrorCode, ErrorResponse, ItemStatus, Scry, SearchRequest,
+    Config, ContentsRequest, Error, ErrorCode, ErrorResponse, ItemStatus, Response, Scry,
+    SearchRequest,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +36,11 @@ enum Command {
     Search(SearchArgs),
     #[command(about = "Read public URLs directly; IDs must also be source URLs")]
     Contents(ContentsArgs),
+    #[command(
+        about = "Serve REST and session-based Streamable HTTP MCP",
+        after_help = "Routes: POST /search, POST /contents, GET /health, /mcp. Set SCRY_AUTH_TOKEN to require Bearer authentication on every route. A non-loopback bind requires this environment variable. Host values must match the allowlist exactly. A bare host does not allow any explicit port. Every Origin header is rejected. REST operations use body-owned futures so disconnects cancel work. Once a REST operation starts, HTTP 200 contains either a Response or an ErrorResponse {\"error\":{\"code\":...,\"message\":...}}. Check the envelope and each result status. Input and access errors use HTTP error codes. MCP supports GET/SSE and cancellation notifications through protocol 2025-11-25. Connections and MCP sessions are each limited to 32. Headers, request bodies, and stalled writes have 10-second limits. Shutdown allows a 5-second drain. Core JSON responses are limited to 1 MiB; MCP text plus structured content allows up to three times that budget plus 1024 bytes. Use a trusted reverse proxy for TLS."
+    )]
+    Serve(ServeArgs),
 }
 
 #[derive(Args)]
@@ -70,6 +79,14 @@ struct ContentsArgs {
     no_text: bool,
     #[arg(long)]
     include_highlights: bool,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    #[arg(long, default_value = "127.0.0.1:8787", value_name = "IP:PORT")]
+    bind: SocketAddr,
+    #[arg(long = "allow-host", value_name = "HOST[:PORT]", action = clap::ArgAction::Append, help = "Add an exact trusted HOST[:PORT] authority; a bare host allows no explicit port")]
+    allow_hosts: Vec<String>,
 }
 
 #[tokio::main]
@@ -140,6 +157,9 @@ async fn main() -> ExitCode {
                 result = service.contents_with_context(request, ctx) => result.map(Some),
             }
         }
+        Command::Serve(args) => http::serve(service, args.bind, args.allow_hosts, shutdown.clone())
+            .await
+            .map(|()| None),
     };
     signal_task.abort();
     if let Ok(Err(error)) = signal_task.await {
@@ -213,4 +233,23 @@ fn write_json(mut writer: impl Write, value: &impl serde::Serialize) -> Result<(
 fn fail(error: Error, code: u8) -> ExitCode {
     let _ = write_json(std::io::stderr().lock(), &ErrorResponse { error });
     ExitCode::from(code)
+}
+
+fn response_bytes(result: Result<Response, Error>, maximum: usize) -> Vec<u8> {
+    match result {
+        Ok(response) => match serde_json::to_vec(&response) {
+            Ok(bytes) if bytes.len() <= maximum => bytes,
+            Ok(_) => error_bytes(Error::new(
+                ErrorCode::TooLarge,
+                "Response exceeds the output budget",
+            )),
+            Err(_) => error_bytes(Error::new(ErrorCode::Internal, "Cannot encode response")),
+        },
+        Err(error) => error_bytes(error),
+    }
+}
+
+fn error_bytes(error: Error) -> Vec<u8> {
+    serde_json::to_vec(&ErrorResponse { error })
+        .expect("ErrorResponse contains only JSON-compatible fields")
 }
