@@ -172,13 +172,13 @@ When a response exceeds the response limit, the service drops `text` fields firs
 
 ## Checks
 
-Run these commands before you commit:
+Run this command before you commit:
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+make check
 ```
+
+The Makefile runs the formatting check, Clippy with warnings denied, and tests in sequence. It never runs the live probe by default.
 
 The default suite covers public contracts, real interface processes, and module boundaries. It must not depend on the public web.
 
@@ -187,7 +187,7 @@ Assert actual behavior and semantic output. Do not generate expected output with
 The live DuckDuckGo probe stays ignored unless explicitly requested:
 
 ```sh
-cargo test --test duckduckgo_live -- --ignored --nocapture
+make test-live
 ```
 
 One successful request does not prove throughput, availability, or search quality.
