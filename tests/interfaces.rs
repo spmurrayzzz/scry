@@ -5,6 +5,11 @@ use std::time::{Duration, Instant};
 use reqwest::Method;
 use serde_json::{Value, json};
 use support::*;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
 
 fn metadata_args() -> Value {
     json!({"urls":["https://EXAMPLE.com:443", "not-a-url", "https://example.com/b"], "ids":["https://example.com/", "https://example.com/c"], "includeText":false})
@@ -332,19 +337,31 @@ async fn http_rest_metadata_validation_body_limits_and_recovery() {
         assert_eq!(response.status(), status);
         assert_error(&json_body(response).await, code);
     }
-    let chunks = futures_util::stream::iter([
-        Ok::<_, std::io::Error>(vec![b' '; 32769]),
-        Ok(vec![b' '; 32769]),
-    ]);
-    let response = server
-        .request(Method::POST, "/contents")
-        .header("content-type", "application/json")
-        .body(reqwest::Body::wrap_stream(chunks))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 413);
-    assert_error(&json_body(response).await, "too_large");
+    let response = timeout(Duration::from_secs(8), async {
+        let mut socket = TcpStream::connect(server.address).await.unwrap();
+        let payload = " ".repeat(65537);
+        let request = format!(
+            "POST /contents HTTP/1.1\r\nHost: {}\r\n\
+             Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n{:x}\r\n{payload}",
+            server.address,
+            payload.len()
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        socket
+            .take((LIMIT + 1) as u64)
+            .read_to_string(&mut response)
+            .await
+            .unwrap();
+        assert!(response.len() <= LIMIT, "HTTP output exceeded limit");
+        response
+    })
+    .await
+    .expect("chunked rejection deadline");
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("HTTP/1.1 413 "), "{headers}");
+    assert_error(&serde_json::from_str(body).unwrap(), "too_large");
     let response = server.request(Method::GET, "/health").send().await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(
