@@ -183,6 +183,8 @@ The Makefile runs the formatting check, Clippy with warnings denied, and tests i
 
 The default suite covers public contracts, real interface processes, and module boundaries. It must not depend on the public web.
 
+Use Tokio's paused clock for deadline assertions. The stdio write deadline tests use bounded in-memory streams through the production session loop. A separate Unix process test checks shutdown with a blocked OS stdout writer.
+
 Assert actual behavior and semantic output. Do not generate expected output with the system under test. Use small inline HTML to isolate parser rules. These fixtures do not establish compatibility with the live provider. Do not fake upstream success or relax security policy for tests.
 
 The live DuckDuckGo probe stays ignored unless explicitly requested:

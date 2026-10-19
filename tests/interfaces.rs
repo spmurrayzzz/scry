@@ -1,6 +1,6 @@
 mod support;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -100,7 +100,7 @@ fn assert_tools(result: &Value) {
 async fn cli(args: &[&str], exit: i32, error: Option<&str>) -> Value {
     let mut command_args = vec!["--json"];
     command_args.extend_from_slice(args);
-    let mut process = Process::spawn(&command_args, None, true);
+    let mut process = Process::spawn(&command_args, None, None);
     process.input.take();
     assert_eq!(process.wait(8).await.code(), Some(exit), "{args:?}");
     let errors = process.remaining_errors();
@@ -177,7 +177,7 @@ async fn cli_invalid_search_uses_json_only_for_operation_errors() {
     let mut process = Process::spawn(
         &["--json", "search", "unused", "--num-results", "0"],
         None,
-        true,
+        None,
     );
     process.input.take();
     assert_eq!(process.wait(8).await.code(), Some(2));
@@ -260,35 +260,78 @@ async fn stdio_sigterm_exits_with_stdin_still_open() {
     assert!(process.output.try_recv().is_err());
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn stdio_unread_os_pipe_times_out_during_preinitialization_pings() {
-    let mut process = Process::spawn(&["mcp"], None, false);
-    #[cfg(target_os = "linux")]
-    let pipe_capacity =
-        rustix::pipe::fcntl_getpipe_size(process.child.stdout.as_ref().unwrap()).unwrap();
-    #[cfg(not(target_os = "linux"))]
-    let pipe_capacity = 2 * 1024 * 1024;
-    let response_bytes = pipe_capacity + 2 * 1024 * 1024;
-    let start = Instant::now();
-    let mut frames = Vec::new();
-    for id in 0..(response_bytes / 400 + 1) {
-        serde_json::to_writer(
-            &mut frames,
-            &json!({"jsonrpc":"2.0","id":format!("{id:0400}"),"method":"ping"}),
-        )
+async fn stdio_eof_exits_with_stdout_write_blocked() {
+    use std::{os::fd::OwnedFd, os::unix::net::UnixStream, process::Stdio};
+
+    use rustix::net::sockopt::{
+        set_socket_recv_buffer_size, set_socket_send_buffer_size, socket_recv_buffer_size,
+        socket_send_buffer_size,
+    };
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (stdout, output) = UnixStream::pair().unwrap();
+    set_socket_send_buffer_size(&stdout, 1024).unwrap();
+    set_socket_recv_buffer_size(&output, 1024).unwrap();
+    let capacity =
+        socket_send_buffer_size(&stdout).unwrap() + socket_recv_buffer_size(&output).unwrap();
+    output.set_nonblocking(true).unwrap();
+    let mut output = BufReader::new(
+        tokio::net::UnixStream::from_std(output)
+            .unwrap()
+            .take((LIMIT + 1) as u64),
+    );
+    let mut process = Process::spawn(&["mcp"], None, Some(Stdio::from(OwnedFd::from(stdout))));
+    process.send(initialize());
+    let mut response = String::new();
+    timeout(Duration::from_secs(8), output.read_line(&mut response))
+        .await
+        .expect("MCP initialization deadline")
         .unwrap();
-        frames.push(b'\n');
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["id"], 1);
+    assert_handshake(&response["result"]);
+    process.send(initialized());
+    let urls: Vec<_> = (0..12)
+        .map(|index| format!("https://example.com/{index}/{}", "x".repeat(4096)))
+        .collect();
+    let arguments = json!({"name":"contents","arguments":{"urls":urls,"includeText":false}});
+    let request = rpc(2, "tools/call", arguments.clone());
+    assert!(serde_json::to_vec(&request).unwrap().len() < 65536);
+    process.send(request);
+    let mut response = String::new();
+    timeout(Duration::from_secs(8), output.read_line(&mut response))
+        .await
+        .expect("MCP metadata response deadline")
+        .unwrap();
+    assert!(response.len() <= LIMIT);
+    assert!(response.len() > capacity + 1);
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["isError"], false);
+    let results = response["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(results.len(), urls.len());
+    for (item, url) in results.iter().zip(&urls) {
+        assert_eq!(item["id"], *url);
+        assert_eq!(item["url"], *url);
+        assert_eq!(item["status"], "ok");
     }
-    process.input.as_ref().unwrap().send(frames).unwrap();
-    assert_eq!(process.wait(20).await.code(), Some(1));
-    assert!(
-        start.elapsed() >= Duration::from_secs(10),
-        "did not exercise the production write deadline"
-    );
-    assert_eq!(
-        String::from_utf8(process.remaining_errors()).unwrap(),
-        "error: MCP stdout write deadline exceeded (10 seconds)\n",
-    );
+    assert!(output.buffer().is_empty());
+    let mut output = output.into_inner();
+    process.send(rpc(3, "tools/call", arguments));
+    let mut prefix = [0; 1];
+    timeout(Duration::from_secs(8), output.read_exact(&mut prefix))
+        .await
+        .expect("MCP response write did not start")
+        .unwrap();
+    assert_eq!(&prefix, b"{");
+    assert!(process.input.take().is_some());
+    assert_eq!(process.wait(3).await.code(), Some(0));
+    assert!(process.remaining_errors().is_empty());
+    drop(output);
 }
 
 #[tokio::test]

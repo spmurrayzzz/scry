@@ -224,14 +224,7 @@ async fn run(cli: Cli) -> ExitCode {
             }
         }
         Ok(None) => ExitCode::SUCCESS,
-        Err(error) => {
-            let code = match error.code {
-                ErrorCode::Cancelled => 130,
-                ErrorCode::InvalidInput | ErrorCode::Unsupported => 2,
-                _ => 1,
-            };
-            fail(error, code, cli.json)
-        }
+        Err(error) => fail_operation(error, cli.json, std::io::stderr().lock()),
     }
 }
 
@@ -324,11 +317,24 @@ fn write_error(mut writer: impl Write, error: &Error) -> Result<(), std::io::Err
     writer.flush()
 }
 
+fn fail_operation(error: Error, json: bool, diagnostics: impl Write) -> ExitCode {
+    let code = match error.code {
+        ErrorCode::Cancelled => 130,
+        ErrorCode::InvalidInput | ErrorCode::Unsupported => 2,
+        _ => 1,
+    };
+    write_failure(error, code, json, diagnostics)
+}
+
 fn fail(error: Error, code: u8, json: bool) -> ExitCode {
+    write_failure(error, code, json, std::io::stderr().lock())
+}
+
+fn write_failure(error: Error, code: u8, json: bool, diagnostics: impl Write) -> ExitCode {
     if json {
-        let _ = write_json(std::io::stderr().lock(), &ErrorResponse { error });
+        let _ = write_json(diagnostics, &ErrorResponse { error });
     } else {
-        let _ = write_error(std::io::stderr().lock(), &error);
+        let _ = write_error(diagnostics, &error);
     }
     ExitCode::from(code)
 }

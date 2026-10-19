@@ -15,13 +15,19 @@ use rmcp::{
     transport::{Transport, async_rw::AsyncRwTransport},
 };
 use scry::{Error, ErrorCode, Scry};
-use tokio::sync::Semaphore;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::Semaphore,
+};
 use tokio_util::{
     bytes::Bytes,
     codec::{FramedRead, LinesCodec, LinesCodecError},
     io::StreamReader,
     sync::CancellationToken,
 };
+
+#[cfg(test)]
+mod tests;
 
 struct State {
     error: Mutex<Option<Error>>,
@@ -39,44 +45,49 @@ impl State {
 }
 
 pub async fn serve(service: Scry, shutdown: CancellationToken) -> Result<(), Error> {
+    serve_io(service, shutdown, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+async fn serve_io(
+    service: Scry,
+    shutdown: CancellationToken,
+    input: impl AsyncRead + Send + Unpin + 'static,
+    output: impl AsyncWrite + Send + Unpin + 'static,
+) -> Result<(), Error> {
     let maximum = service.config().limits.max_request_bytes;
     let state = Arc::new(State {
         error: Mutex::new(None),
         stop: shutdown.child_token(),
     });
     let input_state = state.clone();
-    let input = FramedRead::new(tokio::io::stdin(), LinesCodec::new_with_max_length(maximum)).map(
-        move |line| {
-            let result = match line {
-                Ok(mut line) => {
-                    let valid = serde_json::from_str::<ClientJsonRpcMessage>(&line)
-                        .map_err(|_| {
-                            Error::new(ErrorCode::InvalidInput, "Malformed MCP input frame")
-                        })
-                        .and_then(|_| crate::mcp::validate_legacy_message(line.as_bytes()));
-                    valid.map(|()| {
-                        line.push('\n');
-                        Bytes::from(line)
-                    })
-                }
-                Err(LinesCodecError::MaxLineLengthExceeded) => Err(Error::new(
-                    ErrorCode::TooLarge,
-                    "MCP input frame exceeds max_request_bytes",
-                )),
-                Err(LinesCodecError::Io(_)) => Err(Error::new(
-                    ErrorCode::InvalidInput,
-                    "Cannot read a UTF-8 MCP input frame",
-                )),
-            };
-            result.map_err(|error| {
-                let message = error.message.clone();
-                input_state.fail(error);
-                io::Error::new(io::ErrorKind::InvalidData, message)
-            })
-        },
-    );
+    let input = FramedRead::new(input, LinesCodec::new_with_max_length(maximum)).map(move |line| {
+        let result = match line {
+            Ok(mut line) => {
+                let valid = serde_json::from_str::<ClientJsonRpcMessage>(&line)
+                    .map_err(|_| Error::new(ErrorCode::InvalidInput, "Malformed MCP input frame"))
+                    .and_then(|_| crate::mcp::validate_legacy_message(line.as_bytes()));
+                valid.map(|()| {
+                    line.push('\n');
+                    Bytes::from(line)
+                })
+            }
+            Err(LinesCodecError::MaxLineLengthExceeded) => Err(Error::new(
+                ErrorCode::TooLarge,
+                "MCP input frame exceeds max_request_bytes",
+            )),
+            Err(LinesCodecError::Io(_)) => Err(Error::new(
+                ErrorCode::InvalidInput,
+                "Cannot read a UTF-8 MCP input frame",
+            )),
+        };
+        result.map_err(|error| {
+            let message = error.message.clone();
+            input_state.fail(error);
+            io::Error::new(io::ErrorKind::InvalidData, message)
+        })
+    });
     let transport = BoundedTransport {
-        inner: AsyncRwTransport::new_server(StreamReader::new(input), tokio::io::stdout()),
+        inner: AsyncRwTransport::new_server(StreamReader::new(input), output),
         state: state.clone(),
         requests: Arc::new(Mutex::new(HashMap::new())),
         notifications: Arc::new(Semaphore::new(32)),

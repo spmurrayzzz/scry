@@ -46,15 +46,16 @@ fn reader(
 }
 
 impl Process {
-    pub fn spawn(args: &[&str], token: Option<&str>, read_stdout: bool) -> Self {
+    pub fn spawn(args: &[&str], token: Option<&str>, stdout: Option<Stdio>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_scry"));
         command.args(args).env_remove("SCRY_AUTH_TOKEN");
         if let Some(token) = token {
             command.env("SCRY_AUTH_TOKEN", token);
         }
+        let read_stdout = stdout.is_none();
         let mut child = command
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(stdout.unwrap_or_else(Stdio::piped))
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -177,7 +178,7 @@ pub fn assert_handshake(result: &Value) {
 }
 
 pub async fn stdio() -> Process {
-    let mut process = Process::spawn(&["mcp"], None, true);
+    let mut process = Process::spawn(&["mcp"], None, None);
     process.send(initialize());
     assert_handshake(&process.receive(1).await);
     process.send(initialized());
@@ -201,7 +202,7 @@ impl Server {
                 "allowed.test",
             ],
             token,
-            true,
+            None,
         );
         let line = timeout(Duration::from_secs(8), process.errors.recv())
             .await
