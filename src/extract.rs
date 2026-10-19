@@ -899,7 +899,14 @@ fn render_code(
         }
     }
     out.reserved -= reserved;
-    out.push_checked(&suffix, ctx)?;
+    out.push_checked(
+        if fenced && out.text.ends_with('\n') {
+            &fence
+        } else {
+            &suffix
+        },
+        ctx,
+    )?;
     let completed = (fenced && !out.truncated).then_some(out.text.len());
     if fenced {
         out.line();
@@ -943,7 +950,9 @@ fn render(
             ctx.check()?;
             out.reserved -= suffix.chars().count();
             out.push(&suffix);
-            if item_depth[start] > 0 && matches!(doc.nodes[start].tag.as_str(), "ul" | "ol") {
+            if doc.nodes[start].tag == "table"
+                || item_depth[start] > 0 && matches!(doc.nodes[start].tag.as_str(), "ul" | "ol")
+            {
                 out.paragraph();
             } else if newline {
                 out.line();
