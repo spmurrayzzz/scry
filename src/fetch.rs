@@ -21,6 +21,8 @@ use crate::config::Limits;
 use crate::context::RequestContext;
 use crate::policy::{DomainFilter, parse_url, validate_ip};
 
+mod provider;
+
 #[cfg(test)]
 mod tests;
 
@@ -135,21 +137,28 @@ impl Fetcher {
         mut form: Option<&[(&str, &str)]>,
         ctx: &RequestContext,
     ) -> Result<FetchedPage, Error> {
+        let provider_request = form.is_some() && provider::matches(&url);
         for redirects in 0..=self.limits.max_redirects {
             ctx.check()?;
             let addresses = self.resolve(&url, ctx).await?;
             ctx.check()?;
-            let client = self.client(&url, addresses, ctx)?;
-            let mut request = if let Some(form) = form {
-                client.post(url.clone()).form(form)
+            let response = if provider_request && provider::matches(&url) {
+                provider::send(self, &url, addresses, form, ctx).await?
             } else {
-                client.get(url.clone())
+                let client = self.client(&url, addresses, ctx)?;
+                let request = if let Some(form) = form {
+                    client.post(url.clone()).form(form)
+                } else {
+                    client.get(url.clone())
+                };
+                request
+                    .header(ACCEPT, "text/html, application/xhtml+xml")
+                    .header(ACCEPT_ENCODING, "identity")
+                    .header(CONNECTION, "close")
+                    .send()
+                    .await
+                    .map_err(network_error)?
             };
-            request = request
-                .header(ACCEPT, "text/html, application/xhtml+xml")
-                .header(ACCEPT_ENCODING, "identity")
-                .header(CONNECTION, "close");
-            let response = request.send().await.map_err(network_error)?;
             ctx.check()?;
             let status = response.status();
             if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
@@ -218,7 +227,6 @@ impl Fetcher {
                     }
                 }
                 drop(response);
-                drop(client);
                 url = target;
                 continue;
             }

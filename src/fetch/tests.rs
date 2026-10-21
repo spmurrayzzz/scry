@@ -18,6 +18,16 @@ struct WireServer {
 
 impl WireServer {
     async fn start(status: &str, headers: &str, chunked: bool, chunks: &[&[u8]]) -> Self {
+        Self::start_with_gate(status, headers, chunked, chunks, None).await
+    }
+
+    async fn start_with_gate(
+        status: &str,
+        headers: &str,
+        chunked: bool,
+        chunks: &[&[u8]],
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Self {
         let listener = timeout(BUDGET, TcpListener::bind(("127.0.0.1", 0)))
             .await
             .unwrap()
@@ -50,15 +60,36 @@ impl WireServer {
                 let (mut socket, _) = listener.accept().await?;
                 let mut request = Vec::new();
                 let mut buffer = [0; 1024];
-                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut expected = None;
+                while expected.is_none_or(|size| request.len() < size) {
                     let count = socket.read(&mut buffer).await?;
                     if count == 0 || request.len() + count > 8192 {
-                        return Err(io::Error::other("Missing or oversized request headers"));
+                        return Err(io::Error::other("Missing or oversized request"));
                     }
                     request.extend_from_slice(&buffer[..count]);
+                    if expected.is_none()
+                        && let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    {
+                        let headers =
+                            std::str::from_utf8(&request[..end]).map_err(io::Error::other)?;
+                        let length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then_some(value.trim())
+                        });
+                        let length = length
+                            .map(str::parse::<usize>)
+                            .transpose()
+                            .map_err(io::Error::other)?
+                            .unwrap_or(0);
+                        expected = Some(end + 4 + length);
+                    }
                 }
                 for part in wire {
                     socket.write_all(&part).await?;
+                }
+                if let Some(gate) = gate {
+                    gate.await.map_err(io::Error::other)?;
                 }
                 socket.shutdown().await?;
                 String::from_utf8(request).map_err(io::Error::other)
@@ -378,7 +409,23 @@ async fn connector_frozen_dns_pins_socket_and_preserves_host_without_credentials
         .map(|(_, value)| *value)
         .collect();
     assert_eq!(hosts, [format!("pinned.invalid:{}", server.address.port())]);
-    for forbidden in ["cookie", "authorization", "proxy-authorization", "referer"] {
+    assert!(
+        headers
+            .iter()
+            .any(|(name, value)| name == "user-agent" && *value == "scry/0.1")
+    );
+    for forbidden in [
+        "cookie",
+        "authorization",
+        "proxy-authorization",
+        "referer",
+        "accept-language",
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-user",
+        "sec-fetch-dest",
+        "sec-ch-ua",
+    ] {
         assert!(headers.iter().all(|(name, _)| name != forbidden));
     }
 }

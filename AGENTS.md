@@ -4,7 +4,7 @@
 
 DuckDuckGo access is unofficial. The service can be blocked, challenged, or rate limited. Report these conditions as errors. Never report them as an empty result set.
 
-The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, DDGS, and SearXNG are not runtime dependencies. The project uses Rust edition 2024. Do not add Python or Node.js sidecars.
+The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, DDGS, and SearXNG are not runtime dependencies. The project uses Rust edition 2024. HTTP retrieval uses Reqwest with Rustls. Do not add Python or Node.js sidecars.
 
 ## Layout
 
@@ -13,6 +13,7 @@ The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, 
 - `src/context.rs`: request deadline and cancellation token.
 - `src/policy.rs`: URL syntax checks, destination checks, and domain filters.
 - `src/fetch.rs`: guarded HTTP retrieval. DNS answers are validated and pinned to the connection.
+- `src/fetch/provider.rs`: DuckDuckGo-only request headers. It uses the shared Reqwest client, guarded retrieval path, and bounded HTML decoder.
 - `src/extract.rs`: bounded HTML parsing, text rendering, highlights, and screen detection.
 - `src/duckduckgo.rs`: provider result parsing and redirect unwrapping.
 - `src/service.rs`: request validation, search and contents workflows, concurrency limits, and response bounding.
@@ -136,7 +137,8 @@ An absolute executable path can replace `scry`. Do not put machine-specific path
 - DNS uses system resolvers only. It ignores the hosts file and disables caching. The service validates the answers and pins them to a per-request client. The connection target cannot change after validation.
 - The service validates every redirect again. It rejects HTTPS to HTTP downgrades and cross-origin form redirects. It limits the redirect count and requires one valid Location header.
 - Only identity content encoding and HTML or XHTML content types are accepted. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded. An incomplete response with a declared length is an error.
-- Requests send no cookies, authorization, referers, or proxy credentials. They use HTTP/1.1 with connection close.
+- Requests send no cookies, authorization, or proxy credentials. Page retrieval uses Reqwest, HTTP/1.1, connection close, and no Referer.
+- Search requests to `https://html.duckduckgo.com` use the shared Reqwest/Rustls HTTP/1.1 client with a fixed Chrome 149 User-Agent, HTML Accept header, explicit English language header, and navigation headers with `Sec-Fetch-Site: none`. They send no Referer and do not emulate browser TLS or HTTP/2 behavior. These headers do not apply to `contents` or result-page retrieval. Redirects outside this origin use the ordinary page request headers. Both request paths disable automatic redirects, retries, proxies, and decompression. Provider responses use the same download and decoding limits.
 - Upstream statuses map to explicit errors: 202, 401, and 403 to `upstream_blocked`, 429 to `rate_limited`, and other non-200 statuses to `upstream_failed`. Valid `Retry-After` headers on 202, 401, 403, 429, and 503 set `retryAfterSecs`.
 - Retrieved content is untrusted data. The service never executes page scripts and never loads external resources.
 - Provider requests have a minimum one-second interval between starts. Requests wait for this interval when their deadline permits. The provider lock remains held through challenge detection.
