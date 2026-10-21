@@ -135,7 +135,7 @@ An absolute executable path can replace `scry`. Do not put machine-specific path
 - Blocked destinations include loopback, private, link-local, reserved, multicast, cloud metadata, tailnet, and special-use names and ranges. IPv6 equivalents are included.
 - DNS uses system resolvers only. It ignores the hosts file and disables caching. The service validates the answers and pins them to a per-request client. The connection target cannot change after validation.
 - The service validates every redirect again. It rejects HTTPS to HTTP downgrades and cross-origin form redirects. It limits the redirect count and requires one valid Location header.
-- Only identity content encoding and HTML or XHTML content types are accepted. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded.
+- Only identity content encoding and HTML or XHTML content types are accepted. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded. An incomplete response with a declared length is an error.
 - Requests send no cookies, authorization, referers, or proxy credentials. They use HTTP/1.1 with connection close.
 - Upstream statuses map to explicit errors: 202, 401, and 403 to `upstream_blocked`, 429 to `rate_limited`, and other non-200 statuses to `upstream_failed`. Valid `Retry-After` headers on 202, 401, 403, 429, and 503 set `retryAfterSecs`.
 - Retrieved content is untrusted data. The service never executes page scripts and never loads external resources.

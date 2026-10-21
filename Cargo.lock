@@ -1681,6 +1681,7 @@ dependencies = [
  "futures-util",
  "hickory-resolver",
  "html5gum",
+ "http",
  "httpdate",
  "hyper",
  "hyper-util",

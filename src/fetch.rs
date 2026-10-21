@@ -366,6 +366,7 @@ impl Fetcher {
         encoding: Option<&'static Encoding>,
         ctx: &RequestContext,
     ) -> Result<String, Error> {
+        let expected_length = response.content_length();
         let mut downloaded = 0usize;
         let mut prefix = [0u8; MAX_CHARSET_SNIFF_BYTES];
         let mut prefix_len = 0;
@@ -375,6 +376,12 @@ impl Fetcher {
             let chunk = response.chunk().await.map_err(network_error)?;
             ctx.check()?;
             let last = chunk.is_none();
+            if last && expected_length.is_some_and(|length| length != downloaded as u64) {
+                return Err(Error::new(
+                    ErrorCode::UpstreamFailed,
+                    "Upstream closed an incomplete HTML response",
+                ));
+            }
             let mut input = chunk.as_deref().unwrap_or_default();
             downloaded = downloaded
                 .checked_add(input.len())
