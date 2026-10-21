@@ -303,9 +303,14 @@ async fn body_decoder_rejects_unsupported_mime_charset_and_content_encoding() {
 async fn http_status_helper_maps_errors_and_preserves_retry_after() {
     let fetcher = fetcher(Limits::default());
     for (status, code, retry_after, expected_delay) in [
-        ("202 Accepted", ErrorCode::UpstreamBlocked, "17", None),
-        ("401 Unauthorized", ErrorCode::UpstreamBlocked, "17", None),
-        ("403 Forbidden", ErrorCode::UpstreamBlocked, "17", None),
+        ("202 Accepted", ErrorCode::UpstreamBlocked, "17", Some(17)),
+        (
+            "401 Unauthorized",
+            ErrorCode::UpstreamBlocked,
+            "17",
+            Some(17),
+        ),
+        ("403 Forbidden", ErrorCode::UpstreamBlocked, "17", Some(17)),
         (
             "429 Too Many Requests",
             ErrorCode::RateLimited,

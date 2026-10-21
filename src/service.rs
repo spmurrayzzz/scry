@@ -42,7 +42,51 @@ struct Shared {
     requests: Arc<Semaphore>,
     pipeline: Arc<Semaphore>,
     parsers: Arc<Semaphore>,
-    provider_ready: Mutex<Option<Instant>>,
+    provider: Mutex<ProviderState>,
+}
+
+struct ProviderState {
+    ready: Option<Instant>,
+    failure_cooldown: bool,
+    backoff_secs: u64,
+}
+
+impl ProviderState {
+    fn started(&mut self) {
+        self.ready = Instant::now().checked_add(Duration::from_secs(1));
+        self.failure_cooldown = false;
+    }
+
+    fn finished(&mut self, discovered: &mut Result<Vec<DiscoveredResult>, Error>) {
+        match discovered {
+            Ok(_) => self.backoff_secs = 0,
+            Err(error) => {
+                if matches!(
+                    error.code,
+                    ErrorCode::UpstreamBlocked | ErrorCode::RateLimited
+                ) {
+                    self.backoff_secs = self.backoff_secs.saturating_mul(2).clamp(60, 900);
+                    error.retry_after_secs =
+                        Some(error.retry_after_secs.unwrap_or(0).max(self.backoff_secs));
+                }
+                if let Some(seconds) = error.retry_after_secs
+                    && seconds > 0
+                {
+                    self.ready = match (
+                        self.ready,
+                        Instant::now().checked_add(Duration::from_secs(seconds)),
+                    ) {
+                        (Some(previous), Some(next)) => Some(previous.max(next)),
+                        _ => None,
+                    };
+                    self.failure_cooldown = true;
+                    error
+                        .message
+                        .push_str(". scry applies a DuckDuckGo retry cooldown");
+                }
+            }
+        }
+    }
 }
 
 impl Scry {
@@ -55,7 +99,11 @@ impl Scry {
                 requests: Arc::new(Semaphore::new(limits.max_requests)),
                 pipeline: Arc::new(Semaphore::new(limits.max_fetches)),
                 parsers: Arc::new(Semaphore::new(limits.max_parsers)),
-                provider_ready: Mutex::new(Some(Instant::now())),
+                provider: Mutex::new(ProviderState {
+                    ready: Some(Instant::now()),
+                    failure_cooldown: false,
+                    backoff_secs: 0,
+                }),
                 config,
             }),
         })
@@ -362,12 +410,13 @@ impl Scry {
         query: String,
         ctx: &RequestContext,
     ) -> Result<Vec<DiscoveredResult>, Error> {
-        let mut ready = within(ctx, self.inner.provider_ready.lock()).await?;
-        let Some(next) = *ready else {
+        let mut provider = within(ctx, self.inner.provider.lock()).await?;
+        let Some(next) = provider.ready else {
             return Err(provider_rate_limited(u64::MAX));
         };
-        if next >= ctx.deadline {
-            let remaining = next.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        if (provider.failure_cooldown && next > now) || next >= ctx.deadline {
+            let remaining = next.saturating_duration_since(now);
             return Err(provider_rate_limited(
                 remaining
                     .as_secs()
@@ -378,7 +427,7 @@ impl Scry {
         let pipeline_permit = within(ctx, self.inner.pipeline.clone().acquire_owned())
             .await?
             .map_err(|_| Error::new(ErrorCode::Internal, "Pipeline limiter closed"))?;
-        *ready = Instant::now().checked_add(Duration::from_secs(1));
+        provider.started();
         let url = Url::parse("https://html.duckduckgo.com/html/")
             .map_err(|_| Error::new(ErrorCode::Internal, "Invalid provider URL"))?;
         let page = within(
@@ -390,23 +439,17 @@ impl Scry {
             ),
         )
         .await?;
-        if let Err(error) = &page
-            && let Some(seconds) = error.retry_after_secs
-        {
-            *ready = match (
-                *ready,
-                Instant::now().checked_add(Duration::from_secs(seconds)),
-            ) {
-                (Some(previous), Some(next)) => Some(previous.max(next)),
-                _ => None,
-            };
-        }
-        drop(ready);
-        let page = page?;
-        self.parse(ctx, pipeline_permit, move |ctx, limits| {
-            duckduckgo::search_results(&page.html, &page.final_url, ctx, limits)
-        })
-        .await
+        let mut discovered = match page {
+            Ok(page) => {
+                self.parse(ctx, pipeline_permit, move |ctx, limits| {
+                    duckduckgo::search_results(&page.html, &page.final_url, ctx, limits)
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        provider.finished(&mut discovered);
+        discovered
     }
 
     async fn enrich(
@@ -492,7 +535,10 @@ async fn within<T>(ctx: &RequestContext, future: impl Future<Output = T>) -> Res
 }
 
 fn provider_rate_limited(seconds: u64) -> Error {
-    let mut error = Error::new(ErrorCode::RateLimited, "DuckDuckGo is in a retry cooldown");
+    let mut error = Error::new(
+        ErrorCode::RateLimited,
+        "scry applies a DuckDuckGo retry cooldown",
+    );
     error.retry_after_secs = Some(seconds);
     error
 }

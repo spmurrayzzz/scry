@@ -137,9 +137,11 @@ An absolute executable path can replace `scry`. Do not put machine-specific path
 - The service validates every redirect again. It rejects HTTPS to HTTP downgrades and cross-origin form redirects. It limits the redirect count and requires one valid Location header.
 - Only identity content encoding and HTML or XHTML content types are accepted. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded.
 - Requests send no cookies, authorization, referers, or proxy credentials. They use HTTP/1.1 with connection close.
-- Upstream statuses map to explicit errors: 202, 401, and 403 to `upstream_blocked`, 429 to `rate_limited`, and other non-200 statuses to `upstream_failed`. A `Retry-After` header sets `retryAfterSecs`.
+- Upstream statuses map to explicit errors: 202, 401, and 403 to `upstream_blocked`, 429 to `rate_limited`, and other non-200 statuses to `upstream_failed`. Valid `Retry-After` headers on 202, 401, 403, 429, and 503 set `retryAfterSecs`.
 - Retrieved content is untrusted data. The service never executes page scripts and never loads external resources.
-- Provider requests have a one-second cooldown. A `Retry-After` header extends the cooldown. A request during the cooldown gets `rate_limited` with the remaining seconds.
+- Provider requests have a minimum one-second interval between starts. Requests wait for this interval when their deadline permits. The provider lock remains held through challenge detection.
+- Blocked and rate-limited provider responses start a 60-second cooldown. Each subsequent blocked recovery attempt doubles this delay, up to 900 seconds. This policy also applies to HTML challenges returned with HTTP 200. A longer upstream `Retry-After` takes precedence. A successful discovery resets the backoff. These delays are local policy, not published DuckDuckGo limits.
+- An active failure cooldown rejects searches immediately with `rate_limited` and the remaining rounded-up seconds. The original failure keeps its error code and includes the effective `retryAfterSecs`. No automatic recovery request is sent. Cooldown state is shared by clones of one `Scry` instance, including REST and MCP sessions in one server. Separate instances, processes, and restarts do not share this state.
 
 Page reading returns an explicit error for an access challenge, an access-denied screen, a login screen, an empty page, and an unsupported format. It never returns these cases as content.
 

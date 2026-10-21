@@ -8,6 +8,468 @@ fn metadata_request() -> ContentsRequest {
     }
 }
 
+fn search_request() -> SearchRequest {
+    SearchRequest {
+        query: "reqwest ClientBuilder".into(),
+        ..SearchRequest::default()
+    }
+}
+
+fn provider_state() -> ProviderState {
+    ProviderState {
+        ready: Some(Instant::now()),
+        failure_cooldown: false,
+        backoff_secs: 0,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_state_blocked_recoveries_double_from_sixty_seconds_and_cap_at_nine_hundred() {
+    for code in [ErrorCode::UpstreamBlocked, ErrorCode::RateLimited] {
+        let mut provider = provider_state();
+        for seconds in [60, 120, 240, 480, 900, 900] {
+            provider.started();
+            let started = Instant::now();
+            tokio::time::advance(Duration::from_millis(250)).await;
+            let mut result = Err(Error::new(code, "Provider refused the request"));
+            provider.finished(&mut result);
+            let error = result.err().unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.retry_after_secs, Some(seconds));
+            assert!(error.message.starts_with("Provider refused the request"));
+            assert!(
+                error
+                    .message
+                    .contains("scry applies a DuckDuckGo retry cooldown")
+            );
+            assert_eq!(provider.backoff_secs, seconds);
+            assert!(provider.failure_cooldown);
+            assert_eq!(
+                provider.ready,
+                Some(started + Duration::from_millis(250) + Duration::from_secs(seconds))
+            );
+            tokio::time::advance(Duration::from_secs(seconds)).await;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_state_success_resets_backoff_but_keeps_start_spacing() {
+    let mut provider = provider_state();
+    for seconds in [60, 120] {
+        provider.started();
+        provider.finished(&mut Err(Error::new(ErrorCode::UpstreamBlocked, "Blocked")));
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+    }
+    assert_eq!(provider.backoff_secs, 120);
+    provider.started();
+    let next = Instant::now() + Duration::from_secs(1);
+    let mut success = Ok(Vec::new());
+    provider.finished(&mut success);
+    assert!(success.is_ok());
+    assert_eq!(provider.backoff_secs, 0);
+    assert!(!provider.failure_cooldown);
+    assert_eq!(provider.ready, Some(next));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    provider.started();
+    let mut blocked = Err(Error::new(ErrorCode::UpstreamBlocked, "Blocked again"));
+    provider.finished(&mut blocked);
+    assert_eq!(blocked.err().unwrap().retry_after_secs, Some(60));
+    assert_eq!(provider.backoff_secs, 60);
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_state_retry_after_precedence_includes_zero_overflow_and_nonblocked_errors() {
+    for code in [
+        ErrorCode::UpstreamBlocked,
+        ErrorCode::RateLimited,
+        ErrorCode::UpstreamFailed,
+    ] {
+        for retry in [None, Some(0), Some(30), Some(1200), Some(u64::MAX)] {
+            let blocked = code != ErrorCode::UpstreamFailed;
+            let expected = match (blocked, retry) {
+                (true, None | Some(0) | Some(30)) => Some(60),
+                (_, retry) => retry,
+            };
+            let mut provider = provider_state();
+            provider.started();
+            let started = Instant::now();
+            let mut result = Err(Error {
+                code,
+                message: "Upstream returned HTTP 503".into(),
+                retry_after_secs: retry,
+            });
+            provider.finished(&mut result);
+            let error = result.err().unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.retry_after_secs, expected);
+            assert_eq!(provider.backoff_secs, if blocked { 60 } else { 0 });
+            assert_eq!(provider.failure_cooldown, expected.is_some_and(|n| n > 0));
+            match expected {
+                Some(u64::MAX) => assert!(provider.ready.is_none()),
+                Some(seconds) if seconds > 0 => {
+                    assert_eq!(provider.ready, Some(started + Duration::from_secs(seconds)));
+                    tokio::time::advance(Duration::from_secs(seconds)).await;
+                    provider.started();
+                    let mut recovery = Err(Error::new(ErrorCode::UpstreamBlocked, "Blocked"));
+                    provider.finished(&mut recovery);
+                    assert_eq!(
+                        recovery.err().unwrap().retry_after_secs,
+                        Some(if blocked { 120 } else { 60 })
+                    );
+                }
+                _ => {
+                    assert_eq!(provider.ready, Some(started + Duration::from_secs(1)));
+                    assert_eq!(error.message, "Upstream returned HTTP 503");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_state_other_errors_and_cancellation_do_not_add_or_reset_backoff() {
+    for code in [
+        ErrorCode::InvalidInput,
+        ErrorCode::Unsupported,
+        ErrorCode::BlockedDestination,
+        ErrorCode::DomainFiltered,
+        ErrorCode::DnsFailed,
+        ErrorCode::UpstreamFailed,
+        ErrorCode::Timeout,
+        ErrorCode::Cancelled,
+        ErrorCode::TooLarge,
+        ErrorCode::UnsupportedContent,
+        ErrorCode::ExtractionFailed,
+        ErrorCode::Overloaded,
+        ErrorCode::Internal,
+    ] {
+        for backoff_secs in [0, 120] {
+            for retry_after_secs in [None, Some(0)] {
+                let mut provider = provider_state();
+                provider.backoff_secs = backoff_secs;
+                provider.started();
+                let ready = provider.ready;
+                let original = Error {
+                    code,
+                    message: "Request failed".into(),
+                    retry_after_secs,
+                };
+                let mut result = Err(original.clone());
+                provider.finished(&mut result);
+                assert_eq!(result.err().unwrap(), original);
+                assert_eq!(provider.ready, ready);
+                assert_eq!(provider.backoff_secs, backoff_secs);
+                assert!(!provider.failure_cooldown);
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_parser_challenge_enters_failure_cooldown_without_changing_its_error_code() {
+    let scry = Scry::new(Config::default()).unwrap();
+    scry.inner.pipeline.close();
+    let mut discovered = duckduckgo::search_results(
+        "<form action='//duckduckgo.com/anomaly.js'><p>Verify you are human.</p></form>",
+        &Url::parse("https://html.duckduckgo.com/html/").unwrap(),
+        &scry.context(),
+        &scry.config().limits,
+    );
+    assert_eq!(
+        discovered.as_ref().err().unwrap().code,
+        ErrorCode::UpstreamBlocked
+    );
+    {
+        let mut provider = scry.inner.provider.lock().await;
+        provider.started();
+        provider.finished(&mut discovered);
+    }
+    let error = discovered.err().unwrap();
+    assert_eq!(error.code, ErrorCode::UpstreamBlocked);
+    assert_eq!(error.retry_after_secs, Some(60));
+    assert!(error.message.contains("access challenge"));
+    let started = Instant::now();
+    let rejected = scry.search(search_request()).await.unwrap_err();
+    assert_eq!(rejected.code, ErrorCode::RateLimited);
+    assert_eq!(rejected.retry_after_secs, Some(60));
+    assert_eq!(Instant::now(), started);
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_cooldown_is_shared_only_by_clones_rejects_fast_rounds_up_and_expires() {
+    let scry = Scry::new(Config::default()).unwrap();
+    scry.inner.pipeline.close();
+    let clone = scry.clone();
+    let separate = Scry::new(Config::default()).unwrap();
+    separate.inner.pipeline.close();
+    {
+        let mut provider = scry.inner.provider.lock().await;
+        provider.started();
+        provider.finished(&mut Err(Error::new(ErrorCode::UpstreamBlocked, "Blocked")));
+    }
+    let started = Instant::now();
+    for (elapsed_ms, remaining) in [(0, 60), (250, 60), (1000, 59), (58000, 1)] {
+        tokio::time::advance(Duration::from_millis(elapsed_ms)).await;
+        for service in [&scry, &clone] {
+            let before = Instant::now();
+            let error = service
+                .search_with_context(
+                    search_request(),
+                    RequestContext::new(Duration::from_secs(300)),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::RateLimited);
+            assert_eq!(error.retry_after_secs, Some(remaining));
+            assert_eq!(Instant::now(), before);
+            assert_eq!(
+                service.inner.requests.available_permits(),
+                service.config().limits.max_requests
+            );
+        }
+    }
+    let error = separate.search(search_request()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.message, "Pipeline limiter closed");
+    assert_eq!(separate.inner.provider.lock().await.backoff_secs, 0);
+    assert_eq!(scry.inner.provider.lock().await.backoff_secs, 60);
+    tokio::time::advance(Duration::from_millis(750)).await;
+    assert_eq!(Instant::now() - started, Duration::from_secs(60));
+    for service in [&scry, &clone] {
+        let error = service.search(search_request()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.message, "Pipeline limiter closed");
+        assert_eq!(error.retry_after_secs, None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_unrepresentable_retry_after_rejects_without_waiting_or_panicking() {
+    let scry = Scry::new(Config::default()).unwrap();
+    scry.inner.pipeline.close();
+    {
+        let mut provider = scry.inner.provider.lock().await;
+        provider.started();
+        provider.finished(&mut Err(Error {
+            code: ErrorCode::UpstreamFailed,
+            message: "Upstream returned HTTP 503".into(),
+            retry_after_secs: Some(u64::MAX),
+        }));
+        assert!(provider.ready.is_none());
+    }
+    let started = Instant::now();
+    let error = scry.search(search_request()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::RateLimited);
+    assert_eq!(error.retry_after_secs, Some(u64::MAX));
+    assert_eq!(Instant::now(), started);
+    assert!(scry.inner.provider.try_lock().is_ok());
+    assert_eq!(
+        scry.inner.requests.available_permits(),
+        scry.config().limits.max_requests
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_spacing_waits_one_second_only_when_the_deadline_permits() {
+    for deadline_ms in [999, 1000, 1001, 2000] {
+        let scry = Scry::new(Config::default()).unwrap();
+        scry.inner.pipeline.close();
+        scry.inner.provider.lock().await.started();
+        let started = Instant::now();
+        let mut pending = Box::pin(scry.search_with_context(
+            search_request(),
+            RequestContext::new(Duration::from_millis(deadline_ms)),
+        ));
+        if deadline_ms <= 1000 {
+            let error = pending.await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::RateLimited);
+            assert_eq!(error.retry_after_secs, Some(1));
+            assert_eq!(Instant::now(), started);
+        } else {
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            assert!(scry.inner.provider.try_lock().is_err());
+            tokio::time::advance(Duration::from_millis(999)).await;
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let error = pending.await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert_eq!(error.message, "Pipeline limiter closed");
+            assert_eq!(Instant::now() - started, Duration::from_secs(1));
+        }
+        let provider = scry.inner.provider.lock().await;
+        assert!(!provider.failure_cooldown);
+        assert_eq!(provider.backoff_secs, 0);
+        assert_eq!(
+            scry.inner.requests.available_permits(),
+            scry.config().limits.max_requests
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_expired_cooldown_recovery_requests_serialize_behind_the_real_pipeline() {
+    let scry = Scry::new(Config {
+        limits: Limits {
+            max_requests: 2,
+            max_fetches: 1,
+            ..Limits::default()
+        },
+    })
+    .unwrap();
+    let _pipeline = scry.inner.pipeline.clone().acquire_owned().await.unwrap();
+    {
+        let mut provider = scry.inner.provider.lock().await;
+        provider.started();
+        provider.finished(&mut Err(Error::new(ErrorCode::UpstreamBlocked, "Blocked")));
+    }
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let clone = scry.clone();
+    let mut first = Box::pin(scry.search(search_request()));
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    assert!(scry.inner.provider.try_lock().is_err());
+    let mut second = Box::pin(clone.search(search_request()));
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    assert_eq!(scry.inner.requests.available_permits(), 0);
+    assert_eq!(
+        scry.search(search_request()).await.unwrap_err().code,
+        ErrorCode::Overloaded
+    );
+    drop(first);
+    assert_eq!(scry.inner.requests.available_permits(), 1);
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    assert!(scry.inner.provider.try_lock().is_err());
+    scry.inner.pipeline.close();
+    let error = second.await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.message, "Pipeline limiter closed");
+    assert_eq!(scry.inner.requests.available_permits(), 2);
+    let provider = scry.inner.provider.try_lock().unwrap();
+    assert_eq!(provider.backoff_secs, 60);
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_mutex_waiters_observe_the_blocked_recovery_cooldown_before_pipeline_io() {
+    let scry = Scry::new(Config::default()).unwrap();
+    scry.inner.pipeline.close();
+    let mut provider = scry.inner.provider.lock().await;
+    provider.started();
+    provider.finished(&mut Err(Error::new(ErrorCode::UpstreamBlocked, "Blocked")));
+    tokio::time::advance(Duration::from_secs(60)).await;
+    provider.started();
+    let clone = scry.clone();
+    let mut first = Box::pin(scry.search(search_request()));
+    let mut second = Box::pin(clone.search(search_request()));
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    provider.finished(&mut Err(Error::new(
+        ErrorCode::UpstreamBlocked,
+        "Blocked recovery",
+    )));
+    drop(provider);
+    let started = Instant::now();
+    for pending in [first, second] {
+        let error = pending.await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::RateLimited);
+        assert_eq!(error.retry_after_secs, Some(120));
+        assert_eq!(Instant::now(), started);
+    }
+    assert_eq!(
+        scry.inner.requests.available_permits(),
+        scry.config().limits.max_requests
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_wait_cancellation_and_dropping_release_admission_and_mutex_without_backoff() {
+    for phase in ["mutex", "spacing", "pipeline"] {
+        for cancel in [true, false] {
+            let scry = Scry::new(Config {
+                limits: Limits {
+                    max_requests: 1,
+                    max_fetches: 1,
+                    ..Limits::default()
+                },
+            })
+            .unwrap();
+            let _pipeline = scry.inner.pipeline.clone().acquire_owned().await.unwrap();
+            let mut provider = scry.inner.provider.lock().await;
+            if phase == "spacing" {
+                provider.started();
+            }
+            let ready = provider.ready;
+            let held = if phase == "mutex" {
+                Some(provider)
+            } else {
+                drop(provider);
+                None
+            };
+            let parent = RequestContext::new(Duration::from_secs(10));
+            let mut pending = Box::pin(scry.search_with_context(search_request(), parent.clone()));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            assert_eq!(scry.inner.requests.available_permits(), 0);
+            assert!(scry.inner.provider.try_lock().is_err());
+            let started = Instant::now();
+            if cancel {
+                parent.cancellation.cancel();
+                assert_eq!(pending.await.unwrap_err().code, ErrorCode::Cancelled);
+            } else {
+                drop(pending);
+                assert!(!parent.cancellation.is_cancelled());
+            }
+            drop(held);
+            assert_eq!(Instant::now(), started);
+            assert_eq!(scry.inner.requests.available_permits(), 1);
+            {
+                let provider = scry.inner.provider.try_lock().unwrap();
+                assert_eq!(provider.ready, ready);
+                assert_eq!(provider.backoff_secs, 0);
+                assert!(!provider.failure_cooldown);
+            }
+            scry.inner.pipeline.close();
+            let error = scry.search(search_request()).await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert_eq!(error.message, "Pipeline limiter closed");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_mutex_and_pipeline_wait_deadlines_release_admission_without_backoff() {
+    for hold_mutex in [true, false] {
+        let scry = Scry::new(Config {
+            limits: Limits {
+                request_timeout_secs: 2,
+                max_fetches: 1,
+                ..Limits::default()
+            },
+        })
+        .unwrap();
+        let _pipeline = scry.inner.pipeline.clone().acquire_owned().await.unwrap();
+        let held = if hold_mutex {
+            Some(scry.inner.provider.lock().await)
+        } else {
+            None
+        };
+        let parent = RequestContext::new(Duration::from_secs(120));
+        let started = Instant::now();
+        let mut pending = Box::pin(scry.search_with_context(search_request(), parent.clone()));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(pending.await.unwrap_err().code, ErrorCode::Timeout);
+        drop(held);
+        assert_eq!(Instant::now() - started, Duration::from_secs(2));
+        assert!(!parent.cancellation.is_cancelled());
+        assert_eq!(
+            scry.inner.requests.available_permits(),
+            scry.config().limits.max_requests
+        );
+        let provider = scry.inner.provider.try_lock().unwrap();
+        assert_eq!(provider.backoff_secs, 0);
+        assert!(!provider.failure_cooldown);
+    }
+}
+
 #[tokio::test]
 async fn search_validation_rejects_unsupported_and_invalid_requests_before_pipeline_io() {
     let scry = Scry::new(Config::default()).unwrap();

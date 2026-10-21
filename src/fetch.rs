@@ -449,7 +449,11 @@ fn check_status(response: &Response) -> Result<(), Error> {
     let mut error = Error::new(code, format!("Upstream returned HTTP {}", status.as_u16()));
     if matches!(
         status,
-        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::ACCEPTED
+            | StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::SERVICE_UNAVAILABLE
     ) {
         error.retry_after_secs = response.headers().get(RETRY_AFTER).and_then(|value| {
             let value = value.to_str().ok()?.trim();
