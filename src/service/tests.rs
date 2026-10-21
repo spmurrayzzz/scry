@@ -23,6 +23,562 @@ fn provider_state() -> ProviderState {
     }
 }
 
+const WEB_BOOTSTRAP: &str = "<link id='deep_preload_link' rel='preload' as='script' href='https://links.duckduckgo.com/d.js?q=test&amp;dp=server-token'>";
+const WEB_CHALLENGE: &str = "let jsa = 7; let multiply = function(num) { return num * 3; }; jsa = multiply(jsa); DDG.deep.initialize('/d.js?o=json&jsa=' + jsa);";
+const WEB_RESULTS: &str = r#"{"results":[{"u":"https://www.rust-lang.org/","t":"<b>Rust</b> &amp; safety","a":"A systems language","n":"/d.js?next=ignored"}]}"#;
+
+fn http_response(status: u16, body: &'static str, retry: Option<u64>) -> reqwest::Response {
+    let mut response = http::Response::builder()
+        .status(status)
+        .header("Content-Type", "application/javascript");
+    if let Some(seconds) = retry {
+        response = response.header("Retry-After", seconds.to_string());
+    }
+    response.body(reqwest::Body::from(body)).unwrap().into()
+}
+
+#[tokio::test]
+async fn script_202_arithmetic_uses_the_production_reader_parser_and_one_guarded_follow() {
+    let scry = Scry::new(Config::default()).unwrap();
+    let ctx = scry.context();
+    let mut calls = Vec::new();
+    let mut responses = std::collections::VecDeque::from([
+        (200, WEB_BOOTSTRAP),
+        (202, WEB_CHALLENGE),
+        (200, WEB_RESULTS),
+    ]);
+    let discovered = scry
+        .discover_with("rust".into(), &ctx, |url, script| {
+            assert!(duckduckgo::is_web_url(&url, script));
+            assert!(scry.inner.provider.try_lock().is_err());
+            calls.push((url.to_string(), script));
+            let (status, body) = responses.pop_front().expect("Unexpected continuation");
+            let mut response = http_response(status, body, None);
+            if !script {
+                response
+                    .headers_mut()
+                    .insert("Content-Type", http::HeaderValue::from_static("text/html"));
+            }
+            scry.inner
+                .fetcher
+                .read_response(response, url, Some(script), &ctx)
+        })
+        .await
+        .unwrap();
+    assert!(responses.is_empty());
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[2],
+        (
+            "https://links.duckduckgo.com/d.js?o=json&jsa=21".into(),
+            true
+        )
+    );
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].url.as_str(), "https://www.rust-lang.org/");
+    assert_eq!(discovered[0].title, "Rust & safety");
+    assert_eq!(discovered[0].snippet, "A systems language");
+    assert!(!discovered[0].truncated);
+    let provider = scry.inner.provider.try_lock().unwrap();
+    assert_eq!(provider.backoff_secs, 0);
+    assert!(!provider.failure_cooldown);
+}
+
+#[tokio::test]
+async fn script_202_unknown_image_json_and_repeated_bodies_preserve_status_retry_and_cooldown() {
+    for scripts in [
+        vec![(202, "let jsa = 7; arbitraryCode();")],
+        vec![(
+            202,
+            "<form id='challenge-form'><div class='anomaly-modal__puzzle'><input type='checkbox' class='anomaly-modal__check' name='image-check_secret'><img class='anomaly-modal__image'></div></form>",
+        )],
+        vec![(202, WEB_RESULTS)],
+        vec![(202, r#"{"results":[]}"#)],
+        vec![(202, "{malformed")],
+        vec![(
+            202,
+            "let jsa = 7; let multiply = function(num) { return num * 3; }; jsa = multiply(jsa); DDG.deep.initialize('https://example.org/d.js?jsa=' + jsa);",
+        )],
+        vec![(202, WEB_CHALLENGE), (202, WEB_CHALLENGE)],
+        vec![(200, WEB_CHALLENGE), (202, WEB_CHALLENGE)],
+        vec![(200, WEB_CHALLENGE), (202, WEB_RESULTS)],
+        vec![(200, WEB_CHALLENGE), (202, "unknown")],
+    ] {
+        let scry = Scry::new(Config::default()).unwrap();
+        let ctx = scry.context();
+        let expected_calls = scripts.len() + 1;
+        let mut responses = std::collections::VecDeque::from(scripts);
+        let mut calls = 0;
+        let error = scry
+            .discover_with("test".into(), &ctx, |url, script| {
+                calls += 1;
+                let response = if script {
+                    let (status, body) =
+                        responses.pop_front().expect("Unexpected challenge follow");
+                    let retry = if calls == 2 && body == WEB_CHALLENGE {
+                        0
+                    } else {
+                        777
+                    };
+                    http_response(status, body, (status == 202).then_some(retry))
+                } else {
+                    let mut response = http_response(200, WEB_BOOTSTRAP, None);
+                    response
+                        .headers_mut()
+                        .insert("Content-Type", http::HeaderValue::from_static("text/html"));
+                    response
+                };
+                scry.inner
+                    .fetcher
+                    .read_response(response, url, Some(script), &ctx)
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(calls, expected_calls);
+        assert!(responses.is_empty());
+        assert_eq!(error.code, ErrorCode::UpstreamBlocked);
+        assert_eq!(error.retry_after_secs, Some(777));
+        assert_eq!(
+            error.message,
+            "Upstream returned HTTP 202. scry applies a DuckDuckGo retry cooldown"
+        );
+        let provider = scry.inner.provider.try_lock().unwrap();
+        assert_eq!(provider.backoff_secs, 60);
+        assert!(provider.failure_cooldown);
+        drop(provider);
+        assert_eq!(
+            scry.search(search_request()).await.unwrap_err().code,
+            ErrorCode::RateLimited
+        );
+    }
+}
+
+#[tokio::test]
+async fn script_202_retry_after_waits_only_when_it_fits_and_cancellation_wins() {
+    for (retry, cancel, expected_calls) in [
+        (0, false, 3),
+        (1, false, 3),
+        (30, false, 2),
+        (777, false, 2),
+        (u64::MAX, false, 2),
+        (1, true, 2),
+    ] {
+        let scry = Scry::new(Config::default()).unwrap();
+        let ctx = scry.context();
+        let mut calls = 0;
+        let mut challenge_at = None;
+        let mut continuation_at = None;
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut discovery = Box::pin(scry.discover_with("test".into(), &ctx, |url, script| {
+            let stage = calls;
+            calls += 1;
+            let (status, body) = [
+                (200, WEB_BOOTSTRAP),
+                (202, WEB_CHALLENGE),
+                (200, WEB_RESULTS),
+            ][stage];
+            if stage == 1 {
+                challenge_at = Some(Instant::now());
+                tokio::time::pause();
+                sent.send(()).unwrap();
+            } else if stage == 2 {
+                continuation_at = Some(Instant::now());
+            }
+            let mut response = http_response(status, body, (status == 202).then_some(retry));
+            if !script {
+                response
+                    .headers_mut()
+                    .insert("Content-Type", http::HeaderValue::from_static("text/html"));
+            }
+            scry.inner
+                .fetcher
+                .read_response(response, url, Some(script), &ctx)
+        }));
+        if cancel {
+            tokio::select! {
+                biased;
+                _ = received.recv() => {},
+                _ = discovery.as_mut() => panic!("Discovery completed before cancellation"),
+            }
+            ctx.cancellation.cancel();
+        }
+        let result = discovery.await;
+        assert_eq!(calls, expected_calls);
+        if expected_calls == 3 {
+            assert_eq!(result.unwrap().len(), 1);
+            assert!(continuation_at.unwrap() - challenge_at.unwrap() >= Duration::from_secs(retry));
+            assert!(!scry.inner.provider.try_lock().unwrap().failure_cooldown);
+        } else if cancel {
+            assert_eq!(result.err().unwrap().code, ErrorCode::Cancelled);
+            assert!(!scry.inner.provider.try_lock().unwrap().failure_cooldown);
+        } else {
+            let error = result.err().unwrap();
+            assert_eq!(error.code, ErrorCode::UpstreamBlocked);
+            assert_eq!(error.retry_after_secs, Some(retry.max(60)));
+            assert!(error.message.starts_with("Upstream returned HTTP 202"));
+            assert!(scry.inner.provider.try_lock().unwrap().failure_cooldown);
+        }
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
+async fn script_202_parser_limits_preserve_the_known_status() {
+    let scry = Scry::new(Config {
+        limits: Limits {
+            max_html_tokens: 30,
+            ..Limits::default()
+        },
+    })
+    .unwrap();
+    let ctx = scry.context();
+    let mut calls = 0;
+    let error = scry
+        .discover_with("test".into(), &ctx, |url, script| {
+            calls += 1;
+            let mut response = http_response(
+                if script { 202 } else { 200 },
+                if script { WEB_CHALLENGE } else { WEB_BOOTSTRAP },
+                script.then_some(777),
+            );
+            if !script {
+                response
+                    .headers_mut()
+                    .insert("Content-Type", http::HeaderValue::from_static("text/html"));
+            }
+            scry.inner
+                .fetcher
+                .read_response(response, url, Some(script), &ctx)
+        })
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(error.code, ErrorCode::UpstreamBlocked);
+    assert_eq!(error.retry_after_secs, Some(777));
+    assert!(error.message.starts_with("Upstream returned HTTP 202"));
+}
+
+#[tokio::test]
+async fn script_202_waits_for_the_existing_parser_limiter_and_keeps_status_at_deadline() {
+    for cancel in [false, true] {
+        let scry = Scry::new(Config::default()).unwrap();
+        let ctx = scry.context();
+        let mut held = None;
+        let mut calls = 0;
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut discovery = Box::pin(scry.discover_with("test".into(), &ctx, |url, script| {
+            calls += 1;
+            if script {
+                held = Some(
+                    scry.inner
+                        .parsers
+                        .clone()
+                        .try_acquire_many_owned(scry.config().limits.max_parsers as u32)
+                        .unwrap(),
+                );
+                sent.send(()).unwrap();
+            }
+            let mut response = http_response(
+                if script { 202 } else { 200 },
+                if script { WEB_CHALLENGE } else { WEB_BOOTSTRAP },
+                script.then_some(777),
+            );
+            if !script {
+                response
+                    .headers_mut()
+                    .insert("Content-Type", http::HeaderValue::from_static("text/html"));
+            }
+            scry.inner
+                .fetcher
+                .read_response(response, url, Some(script), &ctx)
+        }));
+        tokio::select! {
+            biased;
+            _ = received.recv() => {},
+            _ = discovery.as_mut() => panic!("Parser limiter was bypassed"),
+        }
+        assert!(futures_util::poll!(discovery.as_mut()).is_pending());
+        tokio::time::pause();
+        if cancel {
+            ctx.cancellation.cancel();
+        }
+        tokio::time::advance(ctx.deadline - Instant::now()).await;
+        let error = discovery.await.err().unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            error.code,
+            if cancel {
+                ErrorCode::Cancelled
+            } else {
+                ErrorCode::UpstreamBlocked
+            }
+        );
+        if !cancel {
+            assert_eq!(error.retry_after_secs, Some(777));
+            assert!(error.message.starts_with("Upstream returned HTTP 202"));
+        }
+        assert_eq!(
+            scry.inner.provider.try_lock().unwrap().failure_cooldown,
+            !cancel
+        );
+        drop(held);
+        assert_eq!(
+            scry.inner.pipeline.available_permits(),
+            scry.config().limits.max_fetches
+        );
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
+async fn provider_web_workflow_keeps_one_lock_and_pipeline_through_results_or_one_challenge() {
+    for challenge in [false, true] {
+        let scry = Scry::new(Config::default()).unwrap();
+        let ctx = scry.context();
+        let mut calls = Vec::new();
+        let mut bodies = std::collections::VecDeque::from(vec![WEB_BOOTSTRAP]);
+        if challenge {
+            bodies.push_back(WEB_CHALLENGE);
+        }
+        bodies.push_back(WEB_RESULTS);
+        let discovered = scry
+            .discover_with("rust & tls".into(), &ctx, |url, script| {
+                assert!(scry.inner.provider.try_lock().is_err());
+                assert_eq!(
+                    scry.inner.pipeline.available_permits(),
+                    scry.config().limits.max_fetches - 1
+                );
+                calls.push((url.to_string(), script));
+                std::future::ready(Ok(crate::fetch::FetchedPage {
+                    final_url: url,
+                    status_error: None,
+                    html: bodies
+                        .pop_front()
+                        .expect("Unexpected protocol request")
+                        .into(),
+                }))
+            })
+            .await
+            .unwrap();
+        assert!(bodies.is_empty());
+        let mut expected = vec![
+            (
+                "https://duckduckgo.com/?q=rust+%26+tls&t=h_&ia=web".to_owned(),
+                false,
+            ),
+            (
+                "https://links.duckduckgo.com/d.js?o=json&q=test&dp=server-token".to_owned(),
+                true,
+            ),
+        ];
+        if challenge {
+            expected.push((
+                "https://links.duckduckgo.com/d.js?o=json&jsa=21".to_owned(),
+                true,
+            ));
+        }
+        assert_eq!(calls, expected);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].url.as_str(), "https://www.rust-lang.org/");
+        assert_eq!(discovered[0].title, "Rust & safety");
+        assert_eq!(discovered[0].snippet, "A systems language");
+        assert!(!discovered[0].truncated);
+        let provider = scry.inner.provider.try_lock().unwrap();
+        assert_eq!(provider.backoff_secs, 0);
+        assert!(!provider.failure_cooldown);
+        assert_eq!(
+            scry.inner.pipeline.available_permits(),
+            scry.config().limits.max_fetches
+        );
+        assert_eq!(
+            scry.inner.parsers.available_permits(),
+            scry.config().limits.max_parsers
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_web_rejects_image_unknown_and_repeated_challenges_without_more_requests() {
+    for bodies in [
+        vec!["<form id='challenge-form'><p>Verify you are human</p></form>"],
+        vec![WEB_BOOTSTRAP, "<form id='challenge-form'></form>"],
+        vec![WEB_BOOTSTRAP, "let jsa = 7; arbitraryCode();"],
+        vec![WEB_BOOTSTRAP, WEB_CHALLENGE, WEB_CHALLENGE],
+    ] {
+        let scry = Scry::new(Config::default()).unwrap();
+        let ctx = scry.context();
+        let expected_calls = bodies.len();
+        let mut bodies = std::collections::VecDeque::from(bodies);
+        let mut calls = 0;
+        let error = scry
+            .discover_with("test".into(), &ctx, |url, _| {
+                calls += 1;
+                std::future::ready(Ok(crate::fetch::FetchedPage {
+                    final_url: url,
+                    status_error: None,
+                    html: bodies
+                        .pop_front()
+                        .expect("Unexpected challenge follow")
+                        .into(),
+                }))
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(calls, expected_calls);
+        assert!(bodies.is_empty());
+        assert_eq!(error.code, ErrorCode::UpstreamBlocked);
+        assert_eq!(error.retry_after_secs, Some(60));
+        let provider = scry.inner.provider.try_lock().unwrap();
+        assert_eq!(provider.backoff_secs, 60);
+        assert!(provider.failure_cooldown);
+        drop(provider);
+        assert_eq!(
+            scry.search(search_request()).await.unwrap_err().code,
+            ErrorCode::RateLimited
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_web_every_fetch_stage_finishes_known_status_and_retry_even_at_deadline() {
+    for failure_stage in 0..3 {
+        for code in [
+            ErrorCode::UpstreamBlocked,
+            ErrorCode::RateLimited,
+            ErrorCode::UpstreamFailed,
+        ] {
+            let scry = Scry::new(Config::default()).unwrap();
+            let ctx = scry.context();
+            let mut calls = 0;
+            let error = scry
+                .discover_with("test".into(), &ctx, |url, _| {
+                    let stage = calls;
+                    calls += 1;
+                    let deadline = ctx.deadline;
+                    async move {
+                        if stage == failure_stage {
+                            tokio::time::pause();
+                            tokio::time::advance(
+                                deadline.saturating_duration_since(Instant::now()),
+                            )
+                            .await;
+                            Err(Error {
+                                code,
+                                message: "Upstream returned an HTTP error".into(),
+                                retry_after_secs: Some(777),
+                            })
+                        } else {
+                            Ok(crate::fetch::FetchedPage {
+                                final_url: url,
+                                status_error: None,
+                                html: [WEB_BOOTSTRAP, WEB_CHALLENGE][stage].into(),
+                            })
+                        }
+                    }
+                })
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(calls, failure_stage + 1);
+            assert_eq!(error.code, code);
+            assert_eq!(error.retry_after_secs, Some(777));
+            assert!(error.message.starts_with("Upstream returned an HTTP error"));
+            let provider = scry.inner.provider.try_lock().unwrap();
+            assert!(provider.failure_cooldown);
+            assert_eq!(
+                provider.backoff_secs,
+                if code == ErrorCode::UpstreamFailed {
+                    0
+                } else {
+                    60
+                }
+            );
+            assert_eq!(
+                provider.ready,
+                Some(Instant::now() + Duration::from_secs(777))
+            );
+            assert_eq!(
+                scry.inner.pipeline.available_permits(),
+                scry.config().limits.max_fetches
+            );
+            tokio::time::resume();
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_web_stage_cancellation_completes_without_adding_or_resetting_backoff() {
+    for cancellation_stage in 0..3 {
+        let scry = Scry::new(Config::default()).unwrap();
+        scry.inner.provider.lock().await.backoff_secs = 120;
+        let ctx = scry.context();
+        let mut calls = 0;
+        let error = scry
+            .discover_with("test".into(), &ctx, |url, _| {
+                let stage = calls;
+                calls += 1;
+                std::future::ready(if stage == cancellation_stage {
+                    ctx.cancellation.cancel();
+                    Err(Error::cancelled())
+                } else {
+                    Ok(crate::fetch::FetchedPage {
+                        final_url: url,
+                        status_error: None,
+                        html: [WEB_BOOTSTRAP, WEB_CHALLENGE][stage].into(),
+                    })
+                })
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(calls, cancellation_stage + 1);
+        let provider = scry.inner.provider.try_lock().unwrap();
+        assert_eq!(provider.backoff_secs, 120);
+        assert!(!provider.failure_cooldown);
+        assert_eq!(
+            scry.inner.pipeline.available_permits(),
+            scry.config().limits.max_fetches
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_web_parser_wait_cancellation_releases_the_pipeline_and_provider_lock() {
+    let scry = Scry::new(Config::default()).unwrap();
+    let _parsers = scry
+        .inner
+        .parsers
+        .clone()
+        .acquire_many_owned(scry.config().limits.max_parsers as u32)
+        .await
+        .unwrap();
+    let ctx = scry.context();
+    let mut pending = Box::pin(scry.discover_with("test".into(), &ctx, |url, _| {
+        std::future::ready(Ok(crate::fetch::FetchedPage {
+            final_url: url,
+            status_error: None,
+            html: WEB_BOOTSTRAP.into(),
+        }))
+    }));
+    assert!(futures_util::poll!(pending.as_mut()).is_pending());
+    assert!(scry.inner.provider.try_lock().is_err());
+    assert_eq!(
+        scry.inner.pipeline.available_permits(),
+        scry.config().limits.max_fetches - 1
+    );
+    ctx.cancellation.cancel();
+    assert_eq!(pending.await.err().unwrap().code, ErrorCode::Cancelled);
+    assert!(scry.inner.provider.try_lock().is_ok());
+    assert_eq!(
+        scry.inner.pipeline.available_permits(),
+        scry.config().limits.max_fetches
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn provider_state_blocked_recoveries_double_from_sixty_seconds_and_cap_at_nine_hundred() {
     for code in [ErrorCode::UpstreamBlocked, ErrorCode::RateLimited] {
@@ -170,12 +726,13 @@ async fn provider_state_other_errors_and_cancellation_do_not_add_or_reset_backof
 async fn provider_parser_challenge_enters_failure_cooldown_without_changing_its_error_code() {
     let scry = Scry::new(Config::default()).unwrap();
     scry.inner.pipeline.close();
-    let mut discovered = duckduckgo::search_results(
+    let mut discovered = duckduckgo::preload_url(
         "<form action='//duckduckgo.com/anomaly.js'><p>Verify you are human.</p></form>",
-        &Url::parse("https://html.duckduckgo.com/html/").unwrap(),
+        &Url::parse("https://duckduckgo.com/").unwrap(),
         &scry.context(),
         &scry.config().limits,
-    );
+    )
+    .map(|_| Vec::new());
     assert_eq!(
         discovered.as_ref().err().unwrap().code,
         ErrorCode::UpstreamBlocked

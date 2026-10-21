@@ -1,6 +1,6 @@
 # scry
 
-`scry` is a small self-hosted Rust service for agent web search and page reading. One binary provides a CLI, a REST API, and MCP over stdio or Streamable HTTP. Search finds URLs through DuckDuckGo HTML. Page reading gets public HTML pages and returns bounded text and highlights.
+`scry` is a small self-hosted Rust service for agent web search and page reading. One binary provides a CLI, a REST API, and MCP over stdio or Streamable HTTP. Search finds URLs through the DuckDuckGo website and its JSON results script. Page reading gets public HTML pages and returns bounded text and highlights.
 
 DuckDuckGo access is unofficial. The service can be blocked, challenged, or rate limited. Report these conditions as errors. Never report them as an empty result set.
 
@@ -13,9 +13,10 @@ The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, 
 - `src/context.rs`: request deadline and cancellation token.
 - `src/policy.rs`: URL syntax checks, destination checks, and domain filters.
 - `src/fetch.rs`: guarded HTTP retrieval. DNS answers are validated and pinned to the connection.
-- `src/fetch/provider.rs`: DuckDuckGo-only request headers. It uses the shared Reqwest client, guarded retrieval path, and bounded HTML decoder.
+- `src/fetch/provider.rs`: scoped DuckDuckGo website and script headers, plus bounded, redacted error classification. Both stages use the shared guarded retrieval path and bounded decoder.
 - `src/extract.rs`: bounded HTML parsing, text rendering, highlights, and screen detection.
-- `src/duckduckgo.rs`: provider result parsing and redirect unwrapping.
+- `src/duckduckgo.rs`: website preload extraction, JSON result parsing, strict provider URL checks, and result redirect unwrapping.
+- `src/duckduckgo/challenge.rs`: finite arithmetic challenge recognition and bounded calculation. It never executes JavaScript.
 - `src/service.rs`: request validation, search and contents workflows, concurrency limits, and response bounding.
 - `src/http.rs`: REST server.
 - `src/mcp.rs`: shared MCP handler, tool schemas, and HTTP session management.
@@ -135,13 +136,18 @@ An absolute executable path can replace `scry`. Do not put machine-specific path
 - Only HTTP and HTTPS with the standard port. No credentials, control characters, whitespace, or backslash.
 - Blocked destinations include loopback, private, link-local, reserved, multicast, cloud metadata, tailnet, and special-use names and ranges. IPv6 equivalents are included.
 - DNS uses system resolvers only. It ignores the hosts file and disables caching. The service validates the answers and pins them to a per-request client. The connection target cannot change after validation.
-- The service validates every redirect again. It rejects HTTPS to HTTP downgrades and cross-origin form redirects. It limits the redirect count and requires one valid Location header.
-- Only identity content encoding and HTML or XHTML content types are accepted. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded. An incomplete response with a declared length is an error.
+- The service follows 301, 302, 303, 307, and 308 redirects. Each redirect receives URL syntax, length, domain, DNS, TLS, and downgrade checks. Redirect counts are bounded, and each redirect must have exactly one valid Location header. Search redirects must also stay within the strict provider endpoint for the current stage.
+- Only identity content encoding is accepted. Page retrieval and website bootstrap accept only HTML or XHTML. The scoped results-script stage also accepts JSON and JavaScript media types. This exception does not apply to `contents`, even on DuckDuckGo hosts. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded. An incomplete response with a declared length is an error.
 - Requests send no cookies, authorization, or proxy credentials. Page retrieval uses Reqwest, HTTP/1.1, connection close, and no Referer.
-- Search requests to `https://html.duckduckgo.com` use the shared Reqwest/Rustls HTTP/1.1 client with a fixed Chrome 149 User-Agent, HTML Accept header, explicit English language header, and navigation headers with `Sec-Fetch-Site: none`. They send no Referer and do not emulate browser TLS or HTTP/2 behavior. These headers do not apply to `contents` or result-page retrieval. Redirects outside this origin use the ordinary page request headers. Both request paths disable automatic redirects, retries, proxies, and decompression. Provider responses use the same download and decoding limits.
-- Upstream statuses map to explicit errors: 202, 401, and 403 to `upstream_blocked`, 429 to `rate_limited`, and other non-200 statuses to `upstream_failed`. Valid `Retry-After` headers on 202, 401, 403, 429, and 503 set `retryAfterSecs`.
-- Retrieved content is untrusted data. The service never executes page scripts and never loads external resources.
-- Provider requests have a minimum one-second interval between starts. Requests wait for this interval when their deadline permits. The provider lock remains held through challenge detection.
+- Search starts with GET `https://duckduckgo.com/?q=...&t=h_&ia=web`. The bounded parser extracts the server-provided `deep_preload_link` and adds `o=json`. The service retrieves that script and parses its `results` array. It does not construct server tokens, paginate, cache, or fall back to the old HTML backend or another engine.
+- Search uses Reqwest/Rustls HTTP/1.1 with a fixed Chrome 149 User-Agent and an explicit English language header. Website requests use HTML Accept and navigation headers with `Sec-Fetch-Site: none`, without Referer. Script requests use `Accept: */*`, `Sec-Fetch-Dest: script`, `Sec-Fetch-Mode: no-cors`, `Sec-Fetch-Site: same-site`, and the constant Referer `https://duckduckgo.com/`. These headers are scoped to search operations, never ordinary page retrieval. Provider URLs require HTTPS on port 443, no credentials or fragments, and exactly `duckduckgo.com` or `links.duckduckgo.com`. Website paths must be `/`, and script paths must be `/d.js`. Every initial URL and redirect receives this check before DNS. No browser TLS or HTTP/2 impersonation occurs. Both request paths disable automatic redirects, retries, proxies, and decompression. Provider responses use the same download and decoding limits.
+- One recognized arithmetic challenge can produce one additional guarded script GET within the same search. The parser accepts only the known multiplication and four fixed HTML-length additions, with bounded integers, operations, input, and tokens. It does not evaluate arbitrary JavaScript or create a DOM. A repeated, unknown, or image challenge returns `upstream_blocked` and starts the failure cooldown.
+- Only a scoped script-stage HTTP 202 can defer status rejection for finite arithmetic recognition through the existing parser limiter. The body read uses at most 64 KiB downloaded and decoded, subject to lower configured limits, and 250 ms. It skips the read when 500 ms or less remain in the fetch budget. Failed reads, decoding, recognition, parser waits, repeated challenges, and JSON results retain the original HTTP 202 error and `Retry-After`. Cancellation takes precedence.
+- A recognized script-stage HTTP 202 challenge permits the single guarded continuation, with URL and redirect checks unchanged. An explicit `Retry-After` delays that continuation. If the delay cannot fit the request budget, the original rejection starts the cooldown. A successful continuation does not treat the initial HTTP 202 as a blocked recovery attempt.
+- Upstream statuses otherwise map to explicit errors: 202, 401, and 403 to `upstream_blocked`, 429 to `rate_limited`, and other non-200 statuses to `upstream_failed`. Valid `Retry-After` headers on 202, 401, 403, 429, and 503 set `retryAfterSecs`.
+- Other failed HTML responses at either scoped search stage can add a fixed classification: image CAPTCHA, access challenge, or unclassified. Inspection uses at most 32 KiB of downloaded and decoded HTML, 4096 tokens, depth 32, and 250 ms, subject to lower existing limits. It skips inspection when 500 ms or less remain in the fetch budget. Inspection failures retain the original status error and `Retry-After`; cancellation takes precedence. No raw bodies, queries, tokens, cookies, or arbitrary headers enter diagnostics. Diagnostics do not inspect successful responses or ordinary page retrieval.
+- Retrieved content is untrusted data. Page extraction never executes scripts or loads external resources.
+- Search operations have a minimum one-second interval between starts. Operations wait for this interval when their deadline permits. The provider lock covers bootstrap, results, the optional arithmetic follow-up, and parsing. Protocol follow-ups have no additional pacing delay. Parsing uses the bounded blocking parser pool, with the pipeline permit retained across stages. Every completed failure stage updates provider state, including known HTTP errors received at the deadline.
 - Blocked and rate-limited provider responses start a 60-second cooldown. Each subsequent blocked recovery attempt doubles this delay, up to 900 seconds. This policy also applies to HTML challenges returned with HTTP 200. A longer upstream `Retry-After` takes precedence. A successful discovery resets the backoff. These delays are local policy, not published DuckDuckGo limits.
 - An active failure cooldown rejects searches immediately with `rate_limited` and the remaining rounded-up seconds. The original failure keeps its error code and includes the effective `retryAfterSecs`. No automatic recovery request is sent. Cooldown state is shared by clones of one `Scry` instance, including REST and MCP sessions in one server. Separate instances, processes, and restarts do not share this state.
 
@@ -204,14 +210,14 @@ One successful request does not prove throughput, availability, or search qualit
 - Keep this AGENTS.md file up to date. It is the source of truth for the agent contract and the service design.
 - Implement only the requested change. Prefer small direct modules over plugin frameworks and speculative abstractions.
 - Keep provider parsing separate from page retrieval and extraction. Do not build a general provider framework.
-- DuckDuckGo HTML is the current search backend. Keep one search backend. Ask before you change the source.
+- The DuckDuckGo website/JSON workflow is the production search backend. Keep one search backend. Ask before you change the source.
 - Defer these items until a demonstrated need and approval exist:
   - browser automation and authenticated browsing
   - PDFs and media extraction
   - site crawls and background queues
   - persistent caching
   - search indexes, vector databases, embeddings, and LLM summaries
-  - proxy rotation, CAPTCHA solvers, and hidden provider fallback
+  - proxy rotation, general CAPTCHA solvers beyond the finite arithmetic support above, and hidden provider fallback
 - Ask before you replace installed agent tools or change global agent configuration.
 - Tailscale is the preferred access method. Keep the listener private, for example loopback behind Tailscale Serve.
 - The deployment platform and capacity are not selected. Measure resource use before you size a host. Do not provision infrastructure without approval.

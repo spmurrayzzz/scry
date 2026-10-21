@@ -18,7 +18,7 @@ async fn provider_response(
         &fetcher(limits.clone()),
         &url,
         vec![server.address],
-        None,
+        false,
         &ctx,
     )
     .await
@@ -33,32 +33,10 @@ fn header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-#[test]
-fn provider_headers_match_only_the_https_provider_origin() {
-    for (input, expected) in [
-        ("https://html.duckduckgo.com/html/", true),
-        ("https://HTML.DUCKDUCKGO.COM:443/other", true),
-        ("http://html.duckduckgo.com/html/", false),
-        ("https://html.duckduckgo.com:8443/html/", false),
-        ("https://duckduckgo.com/html/", false),
-        ("https://lite.duckduckgo.com/lite/", false),
-        ("https://html.duckduckgo.com.example.org/", false),
-        ("https://sub.html.duckduckgo.com/html/", false),
-        ("https://example.org/?host=html.duckduckgo.com", false),
-    ] {
-        assert_eq!(
-            provider::matches(&Url::parse(input).unwrap()),
-            expected,
-            "{input}"
-        );
-    }
-}
-
 #[tokio::test]
-async fn wire_requests_preserve_pinned_host_form_and_provider_headers() {
+async fn wire_requests_preserve_pinned_host_and_scoped_provider_headers() {
     let limits = Limits::default();
-    let form = [("q", "rust & tls"), ("kl", "us-en"), ("b", "")];
-    for form in [None, Some(form.as_slice())] {
+    for script in [false, true] {
         let mut server = WireServer::start(
             "200 OK",
             "Content-Type: text/html\r\nContent-Length: 11\r\n",
@@ -76,7 +54,7 @@ async fn wire_requests_preserve_pinned_host_form_and_provider_headers() {
             &fetcher(limits.clone()),
             &url,
             vec![server.address],
-            form,
+            script,
             &ctx,
         )
         .await
@@ -93,17 +71,9 @@ async fn wire_requests_preserve_pinned_host_form_and_provider_headers() {
         );
         let request = server.finish().await;
         let (headers, body) = request.split_once("\r\n\r\n").unwrap();
-        if form.is_some() {
-            assert_eq!(headers.lines().next(), Some("POST /page HTTP/1.1"));
-            assert_eq!(body, "q=rust+%26+tls&kl=us-en&b=");
-            assert_eq!(
-                header(&request, "content-type"),
-                Some("application/x-www-form-urlencoded")
-            );
-        } else {
-            assert_eq!(headers.lines().next(), Some("GET /page HTTP/1.1"));
-            assert!(body.is_empty());
-        }
+        assert_eq!(headers.lines().next(), Some("GET /page HTTP/1.1"));
+        assert!(body.is_empty());
+        assert!(header(&request, "content-type").is_none());
         assert_eq!(
             header(&request, "host"),
             Some(format!("pinned.invalid:{}", server.address.port()).as_str())
@@ -113,25 +83,39 @@ async fn wire_requests_preserve_pinned_host_form_and_provider_headers() {
                 .unwrap()
                 .contains("Chrome/149.")
         );
-        assert_eq!(
-            header(&request, "accept"),
-            Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        );
         for (name, value) in [
             ("accept-encoding", "identity"),
             ("accept-language", "en-US,en;q=0.9"),
-            ("sec-fetch-dest", "document"),
-            ("sec-fetch-mode", "navigate"),
-            ("sec-fetch-site", "none"),
-            ("sec-fetch-user", "?1"),
+            ("connection", "close"),
+            (
+                "accept",
+                if script {
+                    "*/*"
+                } else {
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                },
+            ),
+            ("sec-fetch-dest", if script { "script" } else { "document" }),
+            (
+                "sec-fetch-mode",
+                if script { "no-cors" } else { "navigate" },
+            ),
+            ("sec-fetch-site", if script { "same-site" } else { "none" }),
         ] {
             assert_eq!(header(&request, name), Some(value), "{name}");
         }
+        assert_eq!(
+            header(&request, "sec-fetch-user"),
+            if script { None } else { Some("?1") }
+        );
+        assert_eq!(
+            header(&request, "referer"),
+            script.then_some("https://duckduckgo.com/")
+        );
         for name in [
             "cookie",
             "authorization",
             "proxy-authorization",
-            "referer",
             "sec-ch-ua",
             "sec-ch-ua-mobile",
             "sec-ch-ua-platform",
@@ -139,6 +123,53 @@ async fn wire_requests_preserve_pinned_host_form_and_provider_headers() {
             "upgrade-insecure-requests",
         ] {
             assert!(header(&request, name).is_none(), "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_client_does_not_select_provider_headers_from_a_duckduckgo_hostname() {
+    let fetcher = fetcher(Limits::default());
+    for hostname in ["duckduckgo.com", "links.duckduckgo.com"] {
+        let mut server = WireServer::start(
+            "200 OK",
+            "Content-Type: text/html\r\n",
+            false,
+            &[b"<p>page</p>"],
+        )
+        .await;
+        let url = Url::parse(&format!(
+            "http://{hostname}:{}/d.js?o=json",
+            server.address.port()
+        ))
+        .unwrap();
+        let ctx = RequestContext::new(BUDGET);
+        let response = fetcher
+            .client(&url, vec![server.address], &ctx)
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap();
+        let encoding = response_encoding_for(&response, false).unwrap();
+        assert_eq!(
+            fetcher.read_html(response, encoding, &ctx).await.unwrap(),
+            "<p>page</p>"
+        );
+        let request = server.finish().await;
+        assert_eq!(header(&request, "user-agent"), Some("scry/0.1"));
+        for forbidden in [
+            "referer",
+            "accept-language",
+            "sec-fetch-dest",
+            "sec-fetch-mode",
+            "sec-fetch-site",
+            "sec-fetch-user",
+        ] {
+            assert!(
+                header(&request, forbidden).is_none(),
+                "{hostname}: {forbidden}"
+            );
         }
     }
 }
@@ -298,7 +329,7 @@ async fn provider_body_timeout_keeps_its_timeout_classification() {
         &fetcher(limits.clone()),
         &url,
         vec![server.address],
-        None,
+        true,
         &request_ctx,
     )
     .await
@@ -318,13 +349,13 @@ async fn provider_body_timeout_keeps_its_timeout_classification() {
 
 #[tokio::test(start_paused = true)]
 async fn expired_or_cancelled_context_stops_provider_before_connecting() {
-    let url = Url::parse("https://html.duckduckgo.com/html/").unwrap();
+    let url = Url::parse("https://duckduckgo.com/").unwrap();
     for cancelled in [false, true] {
         let ctx = RequestContext::new(if cancelled { BUDGET } else { Duration::ZERO });
         if cancelled {
             ctx.cancellation.cancel();
         }
-        let error = provider::send(&fetcher(Limits::default()), &url, Vec::new(), None, &ctx)
+        let error = provider::send(&fetcher(Limits::default()), &url, Vec::new(), false, &ctx)
             .await
             .unwrap_err();
         assert_eq!(
@@ -367,19 +398,28 @@ impl hyper::body::Body for EarlyEofBody {
 
 #[tokio::test]
 async fn decoder_rejects_eof_with_declared_bytes_still_missing() {
-    let response = Response::from(
-        http::Response::builder()
-            .header(CONTENT_TYPE, "text/html")
-            .header("Content-Length", "5")
-            .body(reqwest::Body::wrap(EarlyEofBody { sent: false }))
-            .unwrap(),
-    );
-    assert_eq!(response.content_length(), Some(5));
-    let encoding = response_encoding(&response).unwrap();
-    let error = fetcher(Limits::default())
-        .read_html(response, encoding, &RequestContext::new(BUDGET))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code, ErrorCode::UpstreamFailed);
-    assert_eq!(error.message, "Upstream closed an incomplete HTML response");
+    for script in [false, true] {
+        let response = Response::from(
+            http::Response::builder()
+                .header(
+                    CONTENT_TYPE,
+                    if script {
+                        "application/json"
+                    } else {
+                        "text/html"
+                    },
+                )
+                .header("Content-Length", "5")
+                .body(reqwest::Body::wrap(EarlyEofBody { sent: false }))
+                .unwrap(),
+        );
+        assert_eq!(response.content_length(), Some(5));
+        let encoding = response_encoding_for(&response, script).unwrap();
+        let error = fetcher(Limits::default())
+            .read_html(response, encoding, &RequestContext::new(BUDGET))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UpstreamFailed);
+        assert_eq!(error.message, "Upstream closed an incomplete HTML response");
+    }
 }

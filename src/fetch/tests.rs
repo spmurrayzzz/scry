@@ -7,6 +7,8 @@ use tokio::time::timeout;
 
 use super::*;
 
+mod provider_diagnostics;
+mod provider_guards;
 mod provider_tls;
 mod provider_transport;
 

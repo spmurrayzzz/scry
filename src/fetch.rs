@@ -36,9 +36,11 @@ pub(crate) struct Fetcher {
     semaphore: Arc<Semaphore>,
 }
 
+#[derive(Debug)]
 pub(crate) struct FetchedPage {
     pub final_url: Url,
     pub html: String,
+    pub status_error: Option<Error>,
 }
 
 impl Fetcher {
@@ -89,13 +91,13 @@ impl Fetcher {
         self.fetch(url, filter, None, ctx).await
     }
 
-    pub(crate) async fn post_form(
+    pub(crate) async fn get_provider(
         &self,
         url: Url,
-        form: &[(&str, &str)],
+        script: bool,
         ctx: &RequestContext,
     ) -> Result<FetchedPage, Error> {
-        self.fetch(url, &DomainFilter::default(), Some(form), ctx)
+        self.fetch(url, &DomainFilter::default(), Some(script), ctx)
             .await
     }
 
@@ -103,7 +105,7 @@ impl Fetcher {
         &self,
         url: Url,
         filter: &DomainFilter,
-        form: Option<&[(&str, &str)]>,
+        provider: Option<bool>,
         parent: &RequestContext,
     ) -> Result<FetchedPage, Error> {
         let mut ctx = parent.child();
@@ -111,11 +113,7 @@ impl Fetcher {
             .deadline
             .min(Instant::now() + Duration::from_secs(self.limits.fetch_timeout_secs));
         ctx.check()?;
-        let url = parse_url(url.as_str(), &self.limits)?;
-        filter.check(&url)?;
-        if let Some(form) = form {
-            self.check_form(form)?;
-        }
+        let url = self.checked_url(url, filter, provider)?;
         let _permit = self.semaphore.clone().try_acquire_owned().map_err(|_| {
             Error::new(
                 ErrorCode::Overloaded,
@@ -125,8 +123,8 @@ impl Fetcher {
         tokio::select! {
             biased;
             _ = ctx.cancellation.cancelled() => Err(Error::cancelled()),
+            result = self.follow(url, filter, provider, &ctx) => result,
             _ = tokio::time::sleep_until(ctx.deadline) => Err(Error::timeout()),
-            result = self.follow(url, filter, form, &ctx) => result,
         }
     }
 
@@ -134,104 +132,70 @@ impl Fetcher {
         &self,
         mut url: Url,
         filter: &DomainFilter,
-        mut form: Option<&[(&str, &str)]>,
+        provider: Option<bool>,
         ctx: &RequestContext,
     ) -> Result<FetchedPage, Error> {
-        let provider_request = form.is_some() && provider::matches(&url);
         for redirects in 0..=self.limits.max_redirects {
             ctx.check()?;
-            let addresses = self.resolve(&url, ctx).await?;
+            let addresses = self
+                .resolve(&url, ctx)
+                .await
+                .map_err(|error| ctx.check().err().unwrap_or(error))?;
             ctx.check()?;
-            let response = if provider_request && provider::matches(&url) {
-                provider::send(self, &url, addresses, form, ctx).await?
-            } else {
-                let client = self.client(&url, addresses, ctx)?;
-                let request = if let Some(form) = form {
-                    client.post(url.clone()).form(form)
+            let response = async {
+                if let Some(script) = provider {
+                    provider::send(self, &url, addresses, script, ctx).await
                 } else {
-                    client.get(url.clone())
-                };
-                request
-                    .header(ACCEPT, "text/html, application/xhtml+xml")
-                    .header(ACCEPT_ENCODING, "identity")
-                    .header(CONNECTION, "close")
-                    .send()
-                    .await
-                    .map_err(network_error)?
-            };
-            ctx.check()?;
-            let status = response.status();
-            if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
-                if redirects == self.limits.max_redirects {
-                    return Err(Error::new(
-                        ErrorCode::UpstreamFailed,
-                        "Redirect limit exceeded",
-                    ));
+                    let client = self.client(&url, addresses, ctx)?;
+                    client
+                        .get(url.clone())
+                        .header(ACCEPT, "text/html, application/xhtml+xml")
+                        .header(ACCEPT_ENCODING, "identity")
+                        .header(CONNECTION, "close")
+                        .send()
+                        .await
+                        .map_err(network_error)
                 }
-                let locations = response.headers().get_all(LOCATION);
-                let mut locations = locations.iter();
-                let location = locations
-                    .next()
-                    .and_then(|value| value.to_str().ok())
-                    .filter(|value| !value.is_empty() && value.len() <= self.limits.max_url_bytes)
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorCode::UpstreamFailed,
-                            "Redirect has no valid Location URL",
-                        )
-                    })?;
-                if locations.next().is_some() {
-                    return Err(Error::new(
-                        ErrorCode::UpstreamFailed,
-                        "Redirect has multiple Location headers",
-                    ));
-                }
-                let authority = location
-                    .strip_prefix("//")
-                    .or_else(|| location.split_once("://").map(|(_, rest)| rest))
-                    .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
-                if location
-                    .chars()
-                    .any(|c| c.is_control() || c.is_whitespace())
-                    || location.contains('\\')
-                    || authority
-                        .is_some_and(|authority| authority.is_empty() || authority.contains('@'))
-                {
-                    return Err(Error::new(
-                        ErrorCode::InvalidInput,
-                        "Invalid redirect URL syntax",
-                    ));
-                }
-                let target = url.join(location).map_err(|_| {
-                    Error::new(
-                        ErrorCode::UpstreamFailed,
-                        "Redirect Location URL cannot be resolved",
-                    )
-                })?;
-                let target = parse_url(target.as_str(), &self.limits)?;
-                filter.check(&target)?;
-                if url.scheme() == "https" && target.scheme() != "https" {
-                    return Err(Error::new(
-                        ErrorCode::BlockedDestination,
-                        "HTTPS redirects to HTTP are not allowed",
-                    ));
-                }
-                if form.is_some() {
-                    if matches!(status.as_u16(), 301..=303) {
-                        form = None;
-                    } else if target.origin() != url.origin() {
-                        return Err(Error::new(
-                            ErrorCode::BlockedDestination,
-                            "Redirect cannot forward form data to a different origin",
-                        ));
-                    }
-                }
+            }
+            .await
+            .map_err(|error| ctx.check().err().unwrap_or(error))?;
+            if provider.is_none() || response.status().is_redirection() {
+                ctx.check()?;
+            }
+            if let Some(target) =
+                self.redirect_target(&response, &url, filter, provider, redirects)?
+            {
+                ctx.check()?;
                 drop(response);
                 url = target;
                 continue;
             }
-            check_status(&response)?;
-            let encoding = response_encoding(&response)?;
+            return self.read_response(response, url, provider, ctx).await;
+        }
+        Err(Error::new(ErrorCode::Internal, "Redirect state is invalid"))
+    }
+
+    pub(crate) async fn read_response(
+        &self,
+        response: Response,
+        url: Url,
+        provider: Option<bool>,
+        ctx: &RequestContext,
+    ) -> Result<FetchedPage, Error> {
+        let status_error = if provider == Some(true)
+            && crate::duckduckgo::is_web_url(&url, true)
+            && response.status() == StatusCode::ACCEPTED
+        {
+            check_status(&response).err()
+        } else {
+            None
+        };
+        let html = if let Some(error) = &status_error {
+            provider::read_continuation(self, response, error, ctx).await?
+        } else {
+            let response = provider::check_response(self, response, &url, provider, ctx).await?;
+            ctx.check()?;
+            let encoding = response_encoding_for(&response, provider == Some(true))?;
             if response
                 .content_length()
                 .is_some_and(|size| size > self.limits.max_download_bytes as u64)
@@ -240,12 +204,99 @@ impl Fetcher {
             }
             let html = self.read_html(response, encoding, ctx).await?;
             ctx.check()?;
-            return Ok(FetchedPage {
-                final_url: url,
-                html,
-            });
+            html
+        };
+        Ok(FetchedPage {
+            final_url: url,
+            html,
+            status_error,
+        })
+    }
+
+    fn checked_url(
+        &self,
+        url: Url,
+        filter: &DomainFilter,
+        provider: Option<bool>,
+    ) -> Result<Url, Error> {
+        if let Some(script) = provider
+            && !crate::duckduckgo::is_web_url(&url, script)
+        {
+            return Err(Error::new(
+                ErrorCode::BlockedDestination,
+                "DuckDuckGo request URL is outside the permitted provider endpoint",
+            ));
         }
-        Err(Error::new(ErrorCode::Internal, "Redirect state is invalid"))
+        let url = parse_url(url.as_str(), &self.limits)?;
+        filter.check(&url)?;
+        Ok(url)
+    }
+
+    fn redirect_target(
+        &self,
+        response: &Response,
+        url: &Url,
+        filter: &DomainFilter,
+        provider: Option<bool>,
+        redirects: usize,
+    ) -> Result<Option<Url>, Error> {
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            if redirects == self.limits.max_redirects {
+                return Err(Error::new(
+                    ErrorCode::UpstreamFailed,
+                    "Redirect limit exceeded",
+                ));
+            }
+            let locations = response.headers().get_all(LOCATION);
+            let mut locations = locations.iter();
+            let location = locations
+                .next()
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty() && value.len() <= self.limits.max_url_bytes)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::UpstreamFailed,
+                        "Redirect has no valid Location URL",
+                    )
+                })?;
+            if locations.next().is_some() {
+                return Err(Error::new(
+                    ErrorCode::UpstreamFailed,
+                    "Redirect has multiple Location headers",
+                ));
+            }
+            let authority = location
+                .strip_prefix("//")
+                .or_else(|| location.split_once("://").map(|(_, rest)| rest))
+                .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+            if location
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+                || location.contains('\\')
+                || authority
+                    .is_some_and(|authority| authority.is_empty() || authority.contains('@'))
+            {
+                return Err(Error::new(
+                    ErrorCode::InvalidInput,
+                    "Invalid redirect URL syntax",
+                ));
+            }
+            let target = url.join(location).map_err(|_| {
+                Error::new(
+                    ErrorCode::UpstreamFailed,
+                    "Redirect Location URL cannot be resolved",
+                )
+            })?;
+            let target = self.checked_url(target, filter, provider)?;
+            if url.scheme() == "https" && target.scheme() != "https" {
+                return Err(Error::new(
+                    ErrorCode::BlockedDestination,
+                    "HTTPS redirects to HTTP are not allowed",
+                ));
+            }
+            return Ok(Some(target));
+        }
+        Ok(None)
     }
 
     async fn resolve(&self, url: &Url, ctx: &RequestContext) -> Result<Vec<SocketAddr>, Error> {
@@ -335,43 +386,19 @@ impl Fetcher {
             })
     }
 
-    fn check_form(&self, form: &[(&str, &str)]) -> Result<(), Error> {
-        let mut size = form.len().saturating_sub(1);
-        if form.len() > self.limits.max_request_bytes {
-            return Err(Error::new(
-                ErrorCode::TooLarge,
-                "Outbound form exceeds the request limit",
-            ));
-        }
-        for (key, value) in form {
-            for part in [key, value] {
-                if part.len() > self.limits.max_request_bytes {
-                    return Err(Error::new(
-                        ErrorCode::TooLarge,
-                        "Outbound form exceeds the request limit",
-                    ));
-                }
-                size = size.saturating_add(
-                    url::form_urlencoded::byte_serialize(part.as_bytes())
-                        .map(str::len)
-                        .sum::<usize>(),
-                );
-            }
-            size = size.saturating_add(1);
-            if size > self.limits.max_request_bytes {
-                return Err(Error::new(
-                    ErrorCode::TooLarge,
-                    "Outbound form exceeds the request limit",
-                ));
-            }
-        }
-        Ok(())
-    }
-
     async fn read_html(
         &self,
+        response: Response,
+        encoding: Option<&'static Encoding>,
+        ctx: &RequestContext,
+    ) -> Result<String, Error> {
+        Self::read_html_bounded(response, encoding, &self.limits, ctx).await
+    }
+
+    async fn read_html_bounded(
         mut response: Response,
         encoding: Option<&'static Encoding>,
+        limits: &Limits,
         ctx: &RequestContext,
     ) -> Result<String, Error> {
         let expected_length = response.content_length();
@@ -394,7 +421,7 @@ impl Fetcher {
             downloaded = downloaded
                 .checked_add(input.len())
                 .ok_or_else(download_too_large)?;
-            if downloaded > self.limits.max_download_bytes {
+            if downloaded > limits.max_download_bytes {
                 return Err(download_too_large());
             }
             if decoder.is_none() {
@@ -412,17 +439,17 @@ impl Fetcher {
                     &prefix[..prefix_len],
                     false,
                     &mut html,
-                    &self.limits,
+                    limits,
                     ctx,
                 )?;
                 decoder = Some(selected);
             }
             let decoder = decoder.as_mut().unwrap();
             for input in input.chunks(8192) {
-                decode(decoder, input, false, &mut html, &self.limits, ctx)?;
+                decode(decoder, input, false, &mut html, limits, ctx)?;
             }
             if last {
-                decode(decoder, &[], true, &mut html, &self.limits, ctx)?;
+                decode(decoder, &[], true, &mut html, limits, ctx)?;
                 break;
             }
         }
@@ -487,7 +514,15 @@ fn check_status(response: &Response) -> Result<(), Error> {
     Err(error)
 }
 
+#[cfg(test)]
 fn response_encoding(response: &Response) -> Result<Option<&'static Encoding>, Error> {
+    response_encoding_for(response, false)
+}
+
+fn response_encoding_for(
+    response: &Response,
+    script: bool,
+) -> Result<Option<&'static Encoding>, Error> {
     for header in response.headers().get_all(CONTENT_ENCODING) {
         let value = header.to_str().map_err(|_| unsupported_encoding())?;
         if value
@@ -516,10 +551,16 @@ fn response_encoding(response: &Response) -> Result<Option<&'static Encoding>, E
     }
     let mut parts = content_type.split(';');
     if !parts.next().is_some_and(|kind| {
-        matches!(
-            kind.trim().to_ascii_lowercase().as_str(),
-            "text/html" | "application/xhtml+xml"
-        )
+        let kind = kind.trim().to_ascii_lowercase();
+        matches!(kind.as_str(), "text/html" | "application/xhtml+xml")
+            || (script
+                && matches!(
+                    kind.as_str(),
+                    "application/json"
+                        | "application/javascript"
+                        | "text/javascript"
+                        | "application/x-javascript"
+                ))
     }) {
         return Err(Error::new(
             ErrorCode::UnsupportedContent,

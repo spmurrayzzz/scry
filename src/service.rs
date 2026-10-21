@@ -130,16 +130,11 @@ impl Scry {
         let ctx = self.limit_context(&ctx);
         let _cancel = ctx.cancellation.clone().drop_guard();
         let _admission = self.admit()?;
-        tokio::select! {
-            biased;
-            _ = ctx.cancellation.cancelled() => Err(Error::cancelled()),
-            result = self.search_inner(request, &ctx) => {
-                if ctx.cancellation.is_cancelled() {
-                    Err(Error::cancelled())
-                } else {
-                    result
-                }
-            }
+        let result = self.search_inner(request, &ctx).await;
+        if ctx.cancellation.is_cancelled() {
+            Err(Error::cancelled())
+        } else {
+            result
         }
     }
 
@@ -410,6 +405,22 @@ impl Scry {
         query: String,
         ctx: &RequestContext,
     ) -> Result<Vec<DiscoveredResult>, Error> {
+        self.discover_with(query, ctx, |url, script| {
+            self.inner.fetcher.get_provider(url, script, ctx)
+        })
+        .await
+    }
+
+    async fn discover_with<F, Fut>(
+        &self,
+        query: String,
+        ctx: &RequestContext,
+        mut fetch: F,
+    ) -> Result<Vec<DiscoveredResult>, Error>
+    where
+        F: FnMut(Url, bool) -> Fut,
+        Fut: Future<Output = Result<crate::fetch::FetchedPage, Error>>,
+    {
         let mut provider = within(ctx, self.inner.provider.lock()).await?;
         let Some(next) = provider.ready else {
             return Err(provider_rate_limited(u64::MAX));
@@ -424,30 +435,63 @@ impl Scry {
             ));
         }
         within(ctx, sleep_until(next)).await?;
-        let pipeline_permit = within(ctx, self.inner.pipeline.clone().acquire_owned())
-            .await?
-            .map_err(|_| Error::new(ErrorCode::Internal, "Pipeline limiter closed"))?;
+        let pipeline_permit = Arc::new(
+            within(ctx, self.inner.pipeline.clone().acquire_owned())
+                .await?
+                .map_err(|_| Error::new(ErrorCode::Internal, "Pipeline limiter closed"))?,
+        );
         provider.started();
-        let url = Url::parse("https://html.duckduckgo.com/html/")
-            .map_err(|_| Error::new(ErrorCode::Internal, "Invalid provider URL"))?;
-        let page = within(
-            ctx,
-            self.inner.fetcher.post_form(
-                url,
-                &[("q", query.as_str()), ("kl", "us-en"), ("b", "")],
-                ctx,
-            ),
-        )
-        .await?;
-        let mut discovered = match page {
-            Ok(page) => {
-                self.parse(ctx, pipeline_permit, move |ctx, limits| {
-                    duckduckgo::search_results(&page.html, &page.final_url, ctx, limits)
+        let mut discovered = async {
+            let page = fetch(duckduckgo::web_url(&query)?, false).await?;
+            let mut url = self
+                .parse(ctx, pipeline_permit.clone(), move |ctx, limits| {
+                    duckduckgo::preload_url(&page.html, &page.final_url, ctx, limits)
                 })
-                .await
+                .await?;
+            for follow in 0..2 {
+                let page = fetch(url, true).await?;
+                let status_error = page.status_error;
+                let parsed = self
+                    .parse(ctx, pipeline_permit.clone(), move |ctx, limits| {
+                        duckduckgo::web_results(&page.html, &page.final_url, ctx, limits)
+                    })
+                    .await
+                    .map_err(|error| status_error.clone().unwrap_or(error))?;
+                match parsed {
+                    duckduckgo::WebResponse::Results(results) => {
+                        return status_error.map_or(Ok(results), Err);
+                    }
+                    duckduckgo::WebResponse::Challenge(next) => {
+                        if follow == 1 {
+                            return Err(status_error.unwrap_or_else(|| {
+                                Error::new(
+                                    ErrorCode::UpstreamBlocked,
+                                    "DuckDuckGo repeated an access challenge",
+                                )
+                            }));
+                        }
+                        if let Some(error) = status_error
+                            && let Some(seconds) = error.retry_after_secs
+                        {
+                            let next = Instant::now()
+                                .checked_add(Duration::from_secs(seconds))
+                                .filter(|next| *next < ctx.deadline)
+                                .ok_or_else(|| error.clone())?;
+                            within(ctx, sleep_until(next)).await.map_err(|_| error)?;
+                        }
+                        url = next;
+                    }
+                }
             }
-            Err(error) => Err(error),
-        };
+            Err(Error::new(
+                ErrorCode::Internal,
+                "Search protocol state is invalid",
+            ))
+        }
+        .await;
+        if ctx.cancellation.is_cancelled() {
+            discovered = Err(Error::cancelled());
+        }
         provider.finished(&mut discovered);
         discovered
     }
@@ -462,9 +506,11 @@ impl Scry {
     ) -> SearchResult {
         let extracted = async {
             filter.check(&url)?;
-            let pipeline_permit = within(ctx, self.inner.pipeline.clone().acquire_owned())
-                .await?
-                .map_err(|_| Error::new(ErrorCode::Internal, "Pipeline limiter closed"))?;
+            let pipeline_permit = Arc::new(
+                within(ctx, self.inner.pipeline.clone().acquire_owned())
+                    .await?
+                    .map_err(|_| Error::new(ErrorCode::Internal, "Pipeline limiter closed"))?,
+            );
             let page = within(ctx, self.inner.fetcher.get(url, filter, ctx)).await??;
             filter.check(&page.final_url)?;
             result.final_url = Some(page.final_url.as_str().to_owned());
@@ -497,7 +543,7 @@ impl Scry {
     async fn parse<T, F>(
         &self,
         ctx: &RequestContext,
-        pipeline_permit: OwnedSemaphorePermit,
+        pipeline_permit: Arc<OwnedSemaphorePermit>,
         parse: F,
     ) -> Result<T, Error>
     where

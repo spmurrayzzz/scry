@@ -2,7 +2,7 @@
 
 Web search and HTML extraction for agents. Rust library, CLI, REST API, and MCP over stdio or Streamable HTTP.
 
-Search uses DuckDuckGo HTML. Page retrieval and Markdown extraction run locally. DuckDuckGo access is unofficial and can be blocked or rate limited.
+Search uses the DuckDuckGo website and its JSON results script. Page retrieval and Markdown extraction run locally. DuckDuckGo access is unofficial and can be blocked or rate limited.
 
 ## CLI
 
