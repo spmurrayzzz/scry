@@ -1274,6 +1274,116 @@ async fn clones_share_admission_and_dropping_waiting_operation_releases_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn default_twenty_request_slots_are_shared_by_clones_and_both_operations_and_released() {
+    assert_eq!(Limits::default().max_requests, 20);
+    assert_eq!(Config::default().limits.max_requests, 20);
+    for release in ["complete", "cancel", "drop"] {
+        let scry = Scry::new(Config::default()).unwrap();
+        let clone = scry.clone();
+        assert_eq!(scry.config().limits.max_fetches, 8);
+        let pipeline = scry
+            .inner
+            .pipeline
+            .clone()
+            .try_acquire_many_owned(8)
+            .unwrap();
+        let first_ctx = RequestContext::new(Duration::from_secs(1));
+        let started = Instant::now();
+        let mut pending = Vec::new();
+        for index in 0..20 {
+            let service = if index % 2 == 0 {
+                scry.clone()
+            } else {
+                clone.clone()
+            };
+            let ctx = if index == 0 {
+                first_ctx.clone()
+            } else {
+                service.context()
+            };
+            let mut operation = Box::pin(async move {
+                if index % 2 == 0 {
+                    service
+                        .contents_with_context(
+                            ContentsRequest {
+                                urls: metadata_request().urls,
+                                ..ContentsRequest::default()
+                            },
+                            ctx,
+                        )
+                        .await
+                } else {
+                    service.search_with_context(search_request(), ctx).await
+                }
+            });
+            assert!(futures_util::poll!(operation.as_mut()).is_pending());
+            assert_eq!(scry.inner.requests.available_permits(), 19 - index);
+            pending.push(operation);
+        }
+        for service in [&scry, &clone] {
+            assert_eq!(
+                service.contents(metadata_request()).await.unwrap_err().code,
+                ErrorCode::Overloaded
+            );
+            assert_eq!(
+                service.search(search_request()).await.unwrap_err().code,
+                ErrorCode::Overloaded
+            );
+        }
+        let first = pending.remove(0);
+        match release {
+            "complete" => {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let response = first.await.unwrap();
+                assert_eq!(response.results.len(), 1);
+                assert_eq!(response.results[0].status, ItemStatus::Error);
+                assert_eq!(
+                    response.results[0].error.as_ref().unwrap().code,
+                    ErrorCode::Timeout
+                );
+                assert!(response.results[0].final_url.is_none());
+                assert!(response.results[0].text.is_none());
+            }
+            "cancel" => {
+                first_ctx.cancellation.cancel();
+                assert_eq!(first.await.unwrap_err().code, ErrorCode::Cancelled);
+            }
+            "drop" => drop(first),
+            _ => unreachable!(),
+        }
+        assert_eq!(scry.inner.requests.available_permits(), 1);
+        assert_eq!(first_ctx.cancellation.is_cancelled(), release == "cancel");
+        let response = clone.contents(metadata_request()).await.unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].status, ItemStatus::Ok);
+        assert_eq!(scry.inner.requests.available_permits(), 1);
+        let mut replacement = Box::pin(clone.contents(ContentsRequest {
+            urls: metadata_request().urls,
+            ..ContentsRequest::default()
+        }));
+        assert!(futures_util::poll!(replacement.as_mut()).is_pending());
+        assert_eq!(scry.inner.requests.available_permits(), 0);
+        assert_eq!(
+            scry.search(search_request()).await.unwrap_err().code,
+            ErrorCode::Overloaded
+        );
+        drop(replacement);
+        drop(pending);
+        assert_eq!(scry.inner.requests.available_permits(), 20);
+        assert_eq!(clone.inner.requests.available_permits(), 20);
+        assert!(scry.inner.provider.try_lock().is_ok());
+        assert_eq!(scry.inner.parsers.available_permits(), 2);
+        assert_eq!(scry.inner.pipeline.available_permits(), 0);
+        drop(pipeline);
+        assert_eq!(scry.inner.pipeline.available_permits(), 8);
+        assert_eq!(
+            Instant::now() - started,
+            Duration::from_secs(u64::from(release == "complete"))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn collect_coordinator_keeps_metadata_and_later_filter_failures_while_first_job_waits() {
     let scry = Scry::new(Config {
         limits: Limits {

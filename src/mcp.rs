@@ -29,6 +29,9 @@ use scry::{ContentsRequest, Error, ErrorCode, ErrorResponse, Scry, SearchRequest
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone)]
 pub struct Mcp {
     service: Scry,

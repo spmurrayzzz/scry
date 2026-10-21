@@ -171,7 +171,7 @@ The defaults are in `src/config.rs`. `Limits::validate` rejects zero and enforce
 | Redirects | 5 | 20 |
 | HTML tokens | 100000 | 2000000 |
 | HTML depth | 128 | 1024 |
-| Concurrent requests | 8 | 1024 |
+| Concurrent requests | 20 | 1024 |
 | Concurrent fetches | 8 | 1024 |
 | Concurrent parsers | 2 | 128 |
 | Request timeout (s) | 30 | 300 |

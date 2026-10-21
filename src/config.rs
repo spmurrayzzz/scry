@@ -49,7 +49,7 @@ impl Default for Limits {
             max_redirects: 5,
             max_html_tokens: 100000,
             max_html_depth: 128,
-            max_requests: 8,
+            max_requests: 20,
             max_fetches: 8,
             max_parsers: 2,
             request_timeout_secs: 30,
