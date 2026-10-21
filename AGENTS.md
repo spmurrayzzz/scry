@@ -4,7 +4,7 @@
 
 DuckDuckGo access is unofficial. The service can be blocked, challenged, or rate limited. Report these conditions as errors. Never report them as an empty result set.
 
-The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, DDGS, and SearXNG are not runtime dependencies. The project uses Rust edition 2024. HTTP retrieval uses Reqwest with Rustls. Do not add Python or Node.js sidecars.
+The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, DDGS, and SearXNG are not runtime dependencies. The project uses Rust edition 2024 and requires Rust 1.98 or later. HTTP retrieval uses Reqwest with Rustls. Do not add Python or Node.js sidecars.
 
 ## Layout
 

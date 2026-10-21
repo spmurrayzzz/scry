@@ -7,6 +7,7 @@ use tokio::time::timeout;
 
 use super::*;
 
+mod provider_tls;
 mod provider_transport;
 
 const BUDGET: Duration = Duration::from_secs(3);
