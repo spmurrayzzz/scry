@@ -7,6 +7,7 @@ use tokio::time::timeout;
 
 use super::*;
 
+mod dns_refresh;
 mod provider_diagnostics;
 mod provider_guards;
 mod provider_redirect_dns;
@@ -120,19 +121,15 @@ impl Drop for WireServer {
 }
 
 fn fetcher(limits: Limits) -> Fetcher {
-    let mut options = ResolverOpts::default();
-    options.use_hosts_file = ResolveHosts::Never;
-    let resolver = Resolver::builder_with_config(
-        ResolverConfig::from_name_servers(Vec::new()),
-        TokioRuntimeProvider::default(),
-    )
-    .with_options(options)
-    .build()
-    .unwrap();
     Fetcher {
+        dns: dns::Dns::with_reader(limits.max_fetches, || {
+            Err(Error::new(
+                ErrorCode::DnsFailed,
+                "DNS configuration is unavailable in this fixture",
+            ))
+        }),
         semaphore: Arc::new(Semaphore::new(limits.max_fetches)),
         limits,
-        resolver,
     }
 }
 

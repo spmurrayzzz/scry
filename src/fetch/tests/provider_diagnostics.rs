@@ -647,44 +647,50 @@ async fn provider_diagnostics_leave_a_reserve_before_the_parent_deadline() {
 
 #[tokio::test]
 async fn ordinary_fetch_prioritizes_cancellation_then_deadline_over_a_ready_dns_failure() {
-    use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
+    use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
 
     for (expired, cancelled) in [(false, false), (true, false), (true, true)] {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = socket.local_addr().unwrap();
         let (sent, received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let mut data = [0u8; 4096];
-            let (length, peer) = socket.recv_from(&mut data).await.unwrap();
-            data[2] = 0x81;
-            data[3] = 0x83;
-            data[6..12].fill(0);
-            socket.send_to(&data[..length], peer).await.unwrap();
+            let mut seen = [false; 2];
+            for _ in 0..2 {
+                let mut data = [0u8; 4096];
+                let (length, peer) = socket.recv_from(&mut data).await.unwrap();
+                let name = b"\x07example\x03org\0";
+                let type_offset = 12 + name.len();
+                let question_end = type_offset + 4;
+                assert!(length >= question_end);
+                assert_eq!(&data[12..type_offset], name);
+                let kind = u16::from_be_bytes([data[type_offset], data[type_offset + 1]]);
+                let index = match kind {
+                    1 => 0,
+                    28 => 1,
+                    _ => panic!("Unexpected DNS query type: {kind}"),
+                };
+                assert!(!seen[index]);
+                seen[index] = true;
+                data[2] = 0x81;
+                data[3] = 0x83;
+                data[6..12].fill(0);
+                socket.send_to(&data[..question_end], peer).await.unwrap();
+            }
+            assert_eq!(seen, [true, true]);
             sent.send(()).unwrap();
         });
-        let mut options = ResolverOpts::default();
-        options.ip_strategy = LookupIpStrategy::Ipv4Only;
-        options.use_hosts_file = ResolveHosts::Never;
-        options.attempts = 0;
-        options.timeout = Duration::from_secs(30);
         let mut connection = ConnectionConfig::udp();
         connection.port = address.port();
-        let resolver = Resolver::builder_with_config(
-            ResolverConfig::from_name_servers(vec![NameServerConfig::new(
-                address.ip(),
-                true,
-                vec![connection],
-            )]),
-            TokioRuntimeProvider::default(),
-        )
-        .with_options(options)
-        .build()
-        .unwrap();
+        let config = ResolverConfig::from_name_servers(vec![NameServerConfig::new(
+            address.ip(),
+            true,
+            vec![connection],
+        )]);
         let mut fetcher = fetcher(Limits {
             fetch_timeout_secs: 1,
             ..Limits::default()
         });
-        fetcher.resolver = resolver;
+        fetcher.dns = dns::Dns::with_reader(1, move || Ok(config.clone()));
         let ctx = RequestContext::new(Duration::from_secs(30));
         let filter = DomainFilter::default();
         let mut fetching =

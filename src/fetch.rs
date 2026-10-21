@@ -4,9 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use encoding_rs::{CoderResult, Decoder, Encoding, UTF_8};
-use hickory_resolver::config::{LookupIpStrategy, ResolveHosts, ResolverConfig, ResolverOpts};
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::{Resolver, TokioResolver};
 use html5gum::{DefaultEmitter, Token, Tokenizer};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{
@@ -22,6 +19,7 @@ use crate::config::Limits;
 use crate::context::RequestContext;
 use crate::policy::{DomainFilter, parse_url, validate_ip};
 
+mod dns;
 mod provider;
 
 #[cfg(test)]
@@ -33,7 +31,7 @@ const MAX_CHARSET_SNIFF_BYTES: usize = 1024;
 #[derive(Clone)]
 pub(crate) struct Fetcher {
     limits: Limits,
-    resolver: TokioResolver,
+    dns: dns::Dns,
     semaphore: Arc<Semaphore>,
 }
 
@@ -47,39 +45,10 @@ pub(crate) struct FetchedPage {
 impl Fetcher {
     pub(crate) fn new(limits: Limits) -> Result<Self, Error> {
         limits.validate()?;
-        let (config, _) = hickory_resolver::system_conf::read_system_conf().map_err(|_| {
-            Error::new(
-                ErrorCode::DnsFailed,
-                "Cannot read system DNS server configuration",
-            )
-        })?;
-        if config.name_servers.is_empty() || config.name_servers.len() > 8 {
-            return Err(Error::new(
-                ErrorCode::DnsFailed,
-                "System DNS configuration must contain between one and eight servers",
-            ));
-        }
-        let mut options = ResolverOpts::default();
-        options.timeout = Duration::from_secs(limits.dns_timeout_secs);
-        options.attempts = 0;
-        options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-        options.cache_size = 0;
-        options.use_hosts_file = ResolveHosts::Never;
-        options.num_concurrent_reqs = 1;
-        options.max_active_requests = limits.max_fetches.saturating_mul(2);
-        options.positive_max_ttl = Some(Duration::ZERO);
-        options.negative_max_ttl = Some(Duration::ZERO);
-        let resolver = Resolver::builder_with_config(
-            ResolverConfig::from_name_servers(config.name_servers),
-            TokioRuntimeProvider::default(),
-        )
-        .with_options(options)
-        .build()
-        .map_err(|_| Error::new(ErrorCode::DnsFailed, "Cannot initialize the DNS resolver"))?;
         Ok(Self {
+            dns: dns::Dns::new(&limits)?,
             semaphore: Arc::new(Semaphore::new(limits.max_fetches)),
             limits,
-            resolver,
         })
     }
 
@@ -335,18 +304,7 @@ impl Fetcher {
             Some(Host::Domain(host)) => host,
             None => return Err(Error::new(ErrorCode::InvalidInput, "URL has no hostname")),
         };
-        let deadline = ctx
-            .deadline
-            .min(Instant::now() + Duration::from_secs(self.limits.dns_timeout_secs));
-        let lookup = tokio::time::timeout_at(deadline, self.resolver.lookup_ip(format!("{host}.")))
-            .await
-            .map_err(|_| Error::new(ErrorCode::Timeout, "DNS lookup deadline exceeded"))?
-            .map_err(|_| {
-                Error::new(
-                    ErrorCode::DnsFailed,
-                    "DNS lookup failed or returned no addresses",
-                )
-            })?;
+        let lookup = self.dns.lookup(host, &self.limits, ctx).await?;
         ctx.check()?;
         if lookup.as_lookup().answers().len() > MAX_DNS_ANSWERS {
             return Err(Error::new(

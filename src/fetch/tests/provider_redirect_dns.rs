@@ -1,17 +1,17 @@
 use std::net::Ipv4Addr;
 
-use hickory_resolver::config::{ConnectionConfig, NameServerConfig};
+use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
 use tokio::net::UdpSocket;
 
 use super::*;
 
-struct DnsFixture {
-    resolver: TokioResolver,
+pub(super) struct DnsFixture {
+    pub(super) config: ResolverConfig,
     task: JoinHandle<Vec<(String, Ipv4Addr)>>,
 }
 
 impl DnsFixture {
-    async fn start(answers: [(&str, Ipv4Addr); 2]) -> Self {
+    pub(super) async fn start(answers: &[(&str, Ipv4Addr)]) -> Self {
         let socket = timeout(BUDGET, UdpSocket::bind("127.0.0.1:0"))
             .await
             .unwrap()
@@ -19,50 +19,55 @@ impl DnsFixture {
         let address = socket.local_addr().unwrap();
         let mut connection = ConnectionConfig::udp();
         connection.port = address.port();
-        let mut options = ResolverOpts::default();
-        options.ip_strategy = LookupIpStrategy::Ipv4Only;
-        options.use_hosts_file = ResolveHosts::Never;
-        options.cache_size = 0;
-        options.positive_max_ttl = Some(Duration::ZERO);
-        options.negative_max_ttl = Some(Duration::ZERO);
-        options.attempts = 0;
-        options.timeout = BUDGET;
-        let resolver = Resolver::builder_with_config(
-            ResolverConfig::from_name_servers(vec![NameServerConfig::new(
-                address.ip(),
-                true,
-                vec![connection],
-            )]),
-            TokioRuntimeProvider::default(),
-        )
-        .with_options(options)
-        .build()
-        .unwrap();
-        let answers = answers.map(|(host, ip)| (host.to_owned(), ip));
+        let config = ResolverConfig::from_name_servers(vec![NameServerConfig::new(
+            address.ip(),
+            true,
+            vec![connection],
+        )]);
+        let answers: Vec<_> = answers
+            .iter()
+            .map(|(host, ip)| ((*host).to_owned(), *ip))
+            .collect();
         let task = tokio::spawn(async move {
             timeout(BUDGET, async move {
                 let mut queries = Vec::new();
                 for (host, ip) in answers {
-                    let mut data = [0u8; 4096];
-                    let (length, peer) = socket.recv_from(&mut data).await.unwrap();
-                    assert!(length >= 12);
-                    assert_eq!(&data[4..6], &[0, 1]);
-                    let mut question = Vec::new();
+                    let mut name = Vec::new();
                     for label in host.split('.') {
-                        question.push(u8::try_from(label.len()).unwrap());
-                        question.extend_from_slice(label.as_bytes());
+                        name.push(u8::try_from(label.len()).unwrap());
+                        name.extend_from_slice(label.as_bytes());
                     }
-                    question.extend_from_slice(&[0, 0, 1, 0, 1]);
-                    let question_end = 12 + question.len();
-                    assert!(length >= question_end);
-                    assert_eq!(&data[12..question_end], question);
-                    data[2] = 0x81;
-                    data[3] = 0x80;
-                    data[6..12].copy_from_slice(&[0, 1, 0, 0, 0, 0]);
-                    let mut reply = data[..question_end].to_vec();
-                    reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
-                    reply.extend_from_slice(&ip.octets());
-                    socket.send_to(&reply, peer).await.unwrap();
+                    name.push(0);
+                    let mut seen = [false; 2];
+                    for _ in 0..2 {
+                        let mut data = [0u8; 4096];
+                        let (length, peer) = socket.recv_from(&mut data).await.unwrap();
+                        let type_offset = 12 + name.len();
+                        let question_end = type_offset + 4;
+                        assert!(length >= question_end);
+                        assert_eq!(&data[4..6], &[0, 1]);
+                        assert_eq!(&data[12..type_offset], name);
+                        assert_eq!(&data[type_offset + 2..question_end], &[0, 1]);
+                        let kind = u16::from_be_bytes([data[type_offset], data[type_offset + 1]]);
+                        let index = match kind {
+                            1 => 0,
+                            28 => 1,
+                            _ => panic!("Unexpected DNS query type: {kind}"),
+                        };
+                        assert!(!seen[index], "Duplicate DNS query type: {kind}");
+                        seen[index] = true;
+                        data[2] = 0x81;
+                        data[3] = 0x80;
+                        data[6..12].fill(0);
+                        data[7] = u8::from(kind == 1);
+                        let mut reply = data[..question_end].to_vec();
+                        if kind == 1 {
+                            reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                            reply.extend_from_slice(&ip.octets());
+                        }
+                        socket.send_to(&reply, peer).await.unwrap();
+                    }
+                    assert_eq!(seen, [true, true]);
                     queries.push((host, ip));
                 }
                 queries
@@ -70,10 +75,10 @@ impl DnsFixture {
             .await
             .expect("DNS responder exceeded its budget")
         });
-        Self { resolver, task }
+        Self { config, task }
     }
 
-    async fn finish(&mut self) -> Vec<(String, Ipv4Addr)> {
+    pub(super) async fn finish(&mut self) -> Vec<(String, Ipv4Addr)> {
         timeout(BUDGET, &mut self.task)
             .await
             .expect("DNS responder did not finish")
@@ -97,12 +102,13 @@ async fn assert_redirect_dns_rejected(initial: &str, location: &str, script: boo
                 (initial.host_str().unwrap(), public),
                 (target.host_str().unwrap(), blocked),
             ];
-            let mut dns = DnsFixture::start(answers).await;
+            let mut dns = DnsFixture::start(&answers).await;
             let mut fetcher = fetcher(Limits {
                 max_fetches: 1,
                 ..Limits::default()
             });
-            fetcher.resolver = dns.resolver.clone();
+            let config = dns.config.clone();
+            fetcher.dns = dns::Dns::with_reader(1, move || Ok(config.clone()));
             let mut sends = Vec::new();
             let error = timeout(
                 BUDGET,

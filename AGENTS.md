@@ -13,6 +13,7 @@ The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, 
 - `src/context.rs`: request deadline and cancellation token.
 - `src/policy.rs`: URL syntax checks, destination checks, and domain filters.
 - `src/fetch.rs`: guarded HTTP retrieval. DNS answers are validated and pinned to the connection.
+- `src/fetch/dns.rs`: fresh system DNS configuration for each hostname lookup, bounded configuration reads, and resolver options.
 - `src/fetch/provider.rs`: scoped DuckDuckGo website and script headers, plus bounded, redacted error classification. Both stages use the shared guarded retrieval path and bounded decoder.
 - `src/extract.rs`: bounded HTML parsing, text rendering, highlights, and screen detection.
 - `src/duckduckgo.rs`: website preload extraction, JSON result parsing, strict provider URL checks, and result redirect unwrapping.
@@ -135,7 +136,9 @@ An absolute executable path can replace `scry`. Do not put machine-specific path
 
 - Only HTTP and HTTPS with the standard port. No credentials, control characters, whitespace, or backslash.
 - Blocked destinations include loopback, private, link-local, reserved, multicast, cloud metadata, tailnet, and special-use names and ranges. IPv6 equivalents are included.
-- DNS uses system resolvers only. It ignores the hosts file and disables caching. The service validates the answers and pins them to a per-request client. The connection target cannot change after validation.
+- DNS uses system resolvers only. Each hostname lookup reads the current system DNS configuration and builds a resolver, including after redirects. Existing processes therefore pick up VPN and network DNS changes without a restart. An in-progress lookup can still fail during a change. Configuration read failures and empty or oversized server lists return `dns_failed`, without fallback to old settings or public resolvers. The next lookup reads the configuration again.
+- DNS configuration reads run as blocking tasks, with at most `max_fetches` outstanding reads shared across fetcher clones. Each task retains its permit until completion, even after request cancellation or timeout. Admission, configuration reading, and DNS queries share one DNS deadline within the fetch and request deadlines. DNS timeouts return `timeout`; cancellation takes precedence.
+- DNS ignores the hosts file and disables caching. The service validates all returned addresses and pins them to a per-request client. The connection target cannot change after validation. IP literals skip DNS configuration reads but receive the same destination checks.
 - The service follows 301, 302, 303, 307, and 308 redirects. Each redirect receives URL syntax, length, domain, DNS, TLS, and downgrade checks. Redirect counts are bounded, and each redirect must have exactly one valid Location header. Search redirects must also stay within the strict provider endpoint for the current stage.
 - Only identity content encoding is accepted. Page retrieval and website bootstrap accept only HTML or XHTML. The scoped results-script stage also accepts JSON and JavaScript media types. This exception does not apply to `contents`, even on DuckDuckGo hosts. Character sets come from a BOM, the header, or a bounded meta sniff. Decoding is bounded. An incomplete response with a declared length is an error.
 - Requests send no cookies, authorization, or proxy credentials. Page retrieval uses Reqwest, HTTP/1.1, connection close, and no Referer.
