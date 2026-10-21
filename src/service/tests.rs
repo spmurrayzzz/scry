@@ -85,6 +85,157 @@ async fn script_202_arithmetic_uses_the_production_reader_parser_and_one_guarded
 }
 
 #[tokio::test]
+async fn script_202_captured_wrapper_follows_the_literal_answer_once() {
+    const CHALLENGE: &str = include_str!("../duckduckgo/challenge/fixtures/window_arithmetic.js");
+    let scry = Scry::new(Config::default()).unwrap();
+    let ctx = scry.context();
+    let mut calls = Vec::new();
+    let mut responses = std::collections::VecDeque::from([
+        (200, WEB_BOOTSTRAP),
+        (202, CHALLENGE),
+        (200, WEB_RESULTS),
+    ]);
+    let discovered = scry
+        .discover_with("test".into(), &ctx, |url, script| {
+            assert!(duckduckgo::is_web_url(&url, script));
+            assert!(scry.inner.provider.try_lock().is_err());
+            assert_eq!(scry.inner.pipeline.available_permits(), 7);
+            calls.push((url.to_string(), script));
+            let (status, body) = responses.pop_front().expect("Unexpected continuation");
+            let mut response = http_response(status, body, None);
+            if !script {
+                response
+                    .headers_mut()
+                    .insert("Content-Type", http::HeaderValue::from_static("text/html"));
+            }
+            let read = scry
+                .inner
+                .fetcher
+                .read_response(response, url, Some(script), &ctx);
+            async move {
+                let page = read.await?;
+                if status == 202 {
+                    assert_eq!(page.html, CHALLENGE);
+                    assert_eq!(
+                        page.status_error.as_ref().unwrap().code,
+                        ErrorCode::UpstreamBlocked
+                    );
+                }
+                Ok(page)
+            }
+        })
+        .await
+        .unwrap();
+    assert!(responses.is_empty());
+    assert_eq!(
+        calls,
+        [
+            ("https://duckduckgo.com/?q=test&t=h_&ia=web".into(), false),
+            (
+                "https://links.duckduckgo.com/d.js?o=json&q=test&dp=server-token".into(),
+                true
+            ),
+            (
+                "https://links.duckduckgo.com/d.js?o=json&jsa=28352".into(),
+                true
+            ),
+        ]
+    );
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].url.as_str(), "https://www.rust-lang.org/");
+    assert_eq!(discovered[0].title, "Rust & safety");
+    assert_eq!(discovered[0].snippet, "A systems language");
+    assert!(!discovered[0].truncated);
+    let provider = scry.inner.provider.try_lock().unwrap();
+    assert_eq!(provider.backoff_secs, 0);
+    assert!(!provider.failure_cooldown);
+    assert_eq!(scry.inner.requests.available_permits(), 20);
+    assert_eq!(scry.inner.pipeline.available_permits(), 8);
+    assert_eq!(scry.inner.parsers.available_permits(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn script_202_captured_wrapper_keeps_status_at_parser_wait_deadline_without_continuation() {
+    const CHALLENGE: &str = include_str!("../duckduckgo/challenge/fixtures/window_arithmetic.js");
+    let scry = Scry::new(Config::default()).unwrap();
+    let ctx = scry.context();
+    let mut held = None;
+    let mut calls = Vec::new();
+    let mut responses = std::collections::VecDeque::from([
+        (200, WEB_BOOTSTRAP),
+        (202, CHALLENGE),
+        (200, WEB_RESULTS),
+    ]);
+    let error = scry
+        .discover_with("test".into(), &ctx, |url, script| {
+            assert!(duckduckgo::is_web_url(&url, script));
+            assert!(scry.inner.provider.try_lock().is_err());
+            assert_eq!(scry.inner.pipeline.available_permits(), 7);
+            calls.push((url.to_string(), script));
+            let (status, body) = responses.pop_front().expect("Unexpected continuation");
+            if status == 202 {
+                held = Some(
+                    scry.inner
+                        .parsers
+                        .clone()
+                        .try_acquire_many_owned(scry.config().limits.max_parsers as u32)
+                        .unwrap(),
+                );
+            }
+            let mut response = http_response(status, body, None);
+            if !script {
+                response
+                    .headers_mut()
+                    .insert("Content-Type", http::HeaderValue::from_static("text/html"));
+            }
+            let read = scry
+                .inner
+                .fetcher
+                .read_response(response, url, Some(script), &ctx);
+            async move {
+                let page = read.await?;
+                if status == 202 {
+                    assert_eq!(page.html, CHALLENGE);
+                    assert_eq!(
+                        page.status_error.as_ref().unwrap().code,
+                        ErrorCode::UpstreamBlocked
+                    );
+                }
+                Ok(page)
+            }
+        })
+        .await
+        .err()
+        .expect("Captured challenge bypassed the shared parser limiter");
+    assert!(Instant::now() >= ctx.deadline);
+    assert!(Instant::now() <= ctx.deadline + Duration::from_millis(1));
+    assert_eq!(
+        calls,
+        [
+            ("https://duckduckgo.com/?q=test&t=h_&ia=web".into(), false),
+            (
+                "https://links.duckduckgo.com/d.js?o=json&q=test&dp=server-token".into(),
+                true
+            ),
+        ]
+    );
+    assert_eq!(responses.len(), 1);
+    assert_eq!(error.code, ErrorCode::UpstreamBlocked);
+    assert_eq!(error.retry_after_secs, Some(60));
+    assert_eq!(
+        error.message,
+        "Upstream returned HTTP 202. scry applies a DuckDuckGo retry cooldown"
+    );
+    let provider = scry.inner.provider.try_lock().unwrap();
+    assert_eq!(provider.backoff_secs, 60);
+    assert!(provider.failure_cooldown);
+    assert_eq!(scry.inner.pipeline.available_permits(), 8);
+    assert_eq!(scry.inner.parsers.available_permits(), 0);
+    drop(held.unwrap());
+    assert_eq!(scry.inner.parsers.available_permits(), 2);
+}
+
+#[tokio::test]
 async fn script_202_unknown_image_json_and_repeated_bodies_preserve_status_retry_and_cooldown() {
     for scripts in [
         vec![(202, "let jsa = 7; arbitraryCode();")],

@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -108,6 +109,38 @@ impl Fetcher {
         provider: Option<bool>,
         parent: &RequestContext,
     ) -> Result<FetchedPage, Error> {
+        self.fetch_with(
+            url,
+            filter,
+            provider,
+            parent,
+            |url: Url, addresses, ctx: RequestContext| async move {
+                if let Some(script) = provider {
+                    provider::send(self, &url, addresses, script, &ctx).await
+                } else {
+                    let client = self.client(&url, addresses, &ctx)?;
+                    client
+                        .get(url.clone())
+                        .header(ACCEPT, "text/html, application/xhtml+xml")
+                        .header(ACCEPT_ENCODING, "identity")
+                        .header(CONNECTION, "close")
+                        .send()
+                        .await
+                        .map_err(network_error)
+                }
+            },
+        )
+        .await
+    }
+
+    async fn fetch_with<F: Future<Output = Result<Response, Error>>>(
+        &self,
+        url: Url,
+        filter: &DomainFilter,
+        provider: Option<bool>,
+        parent: &RequestContext,
+        send: impl FnMut(Url, Vec<SocketAddr>, RequestContext) -> F,
+    ) -> Result<FetchedPage, Error> {
         let mut ctx = parent.child();
         ctx.deadline = ctx
             .deadline
@@ -123,17 +156,18 @@ impl Fetcher {
         tokio::select! {
             biased;
             _ = ctx.cancellation.cancelled() => Err(Error::cancelled()),
-            result = self.follow(url, filter, provider, &ctx) => result,
+            result = self.follow_with(url, filter, provider, &ctx, send) => result,
             _ = tokio::time::sleep_until(ctx.deadline) => Err(Error::timeout()),
         }
     }
 
-    async fn follow(
+    async fn follow_with<F: Future<Output = Result<Response, Error>>>(
         &self,
         mut url: Url,
         filter: &DomainFilter,
         provider: Option<bool>,
         ctx: &RequestContext,
+        mut send: impl FnMut(Url, Vec<SocketAddr>, RequestContext) -> F,
     ) -> Result<FetchedPage, Error> {
         for redirects in 0..=self.limits.max_redirects {
             ctx.check()?;
@@ -142,23 +176,9 @@ impl Fetcher {
                 .await
                 .map_err(|error| ctx.check().err().unwrap_or(error))?;
             ctx.check()?;
-            let response = async {
-                if let Some(script) = provider {
-                    provider::send(self, &url, addresses, script, ctx).await
-                } else {
-                    let client = self.client(&url, addresses, ctx)?;
-                    client
-                        .get(url.clone())
-                        .header(ACCEPT, "text/html, application/xhtml+xml")
-                        .header(ACCEPT_ENCODING, "identity")
-                        .header(CONNECTION, "close")
-                        .send()
-                        .await
-                        .map_err(network_error)
-                }
-            }
-            .await
-            .map_err(|error| ctx.check().err().unwrap_or(error))?;
+            let response = send(url.clone(), addresses, ctx.clone())
+                .await
+                .map_err(|error| ctx.check().err().unwrap_or(error))?;
             if provider.is_none() || response.status().is_redirection() {
                 ctx.check()?;
             }

@@ -9,6 +9,7 @@ use super::*;
 
 mod provider_diagnostics;
 mod provider_guards;
+mod provider_redirect_dns;
 mod provider_tls;
 mod provider_transport;
 
