@@ -551,6 +551,72 @@ async fn provider_web_workflow_keeps_one_lock_and_pipeline_through_results_or_on
 }
 
 #[tokio::test]
+async fn provider_web_quoted_queries_accept_padded_short_and_empty_results() {
+    const SHORT_RESULTS: &str = r#"{"results":[
+        {"u":"https://example.com/guide","t":"Guide","a":"First page."},
+        {"u":"https://example.com/reference","t":"Reference","a":"Second page."},
+        {"n":"/d.js?next=sample"},{},{},{},{}
+    ]}"#;
+    const NO_RESULTS: &str = r#"{"results":[
+        {"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":""},{},{},{},{},{},{}
+    ]}"#;
+    for (query, expected_url, body, expected_count) in [
+        (
+            "catalog \"blue lamp\" \"desk\"",
+            "https://duckduckgo.com/?q=catalog+%22blue+lamp%22+%22desk%22&t=h_&ia=web",
+            SHORT_RESULTS,
+            2,
+        ),
+        (
+            "\"sample\" \"rare-component\"",
+            "https://duckduckgo.com/?q=%22sample%22+%22rare-component%22&t=h_&ia=web",
+            NO_RESULTS,
+            0,
+        ),
+        (
+            "\"demo-tool\" \"sample-flag\" catalog",
+            "https://duckduckgo.com/?q=%22demo-tool%22+%22sample-flag%22+catalog&t=h_&ia=web",
+            NO_RESULTS,
+            0,
+        ),
+    ] {
+        let scry = Scry::new(Config::default()).unwrap();
+        let ctx = scry.context();
+        let mut calls = Vec::new();
+        let mut bodies = std::collections::VecDeque::from([WEB_BOOTSTRAP, body]);
+        let discovered = scry
+            .discover_with(query.into(), &ctx, |url, script| {
+                calls.push((url.to_string(), script));
+                std::future::ready(Ok(crate::fetch::FetchedPage {
+                    final_url: url,
+                    status_error: None,
+                    html: bodies
+                        .pop_front()
+                        .expect("Unexpected protocol request")
+                        .into(),
+                }))
+            })
+            .await
+            .unwrap();
+        assert!(bodies.is_empty());
+        assert_eq!(
+            calls,
+            [
+                (expected_url.to_owned(), false),
+                (
+                    "https://links.duckduckgo.com/d.js?o=json&q=test&dp=server-token".to_owned(),
+                    true,
+                ),
+            ]
+        );
+        assert_eq!(discovered.len(), expected_count);
+        let provider = scry.inner.provider.try_lock().unwrap();
+        assert_eq!(provider.backoff_secs, 0);
+        assert!(!provider.failure_cooldown);
+    }
+}
+
+#[tokio::test]
 async fn provider_web_rejects_image_unknown_and_repeated_challenges_without_more_requests() {
     for bodies in [
         vec!["<form id='challenge-form'><p>Verify you are human</p></form>"],

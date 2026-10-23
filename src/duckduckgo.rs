@@ -258,7 +258,7 @@ pub(crate) fn web_results(
     let mut remaining = limits.max_text_chars;
     let mut tokens = 0;
     let mut organic = 0;
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         ctx.check()?;
         let row = row.as_object().ok_or_else(invalid_results)?;
         if ["ad", "is_ad", "isAd"]
@@ -267,12 +267,24 @@ pub(crate) fn web_results(
         {
             continue;
         }
-        if !row.contains_key("u")
-            && row
-                .get("n")
-                .and_then(Value::as_str)
-                .is_some_and(|n| provider_target(n, base, limits).is_ok())
+        let no_results = row.get("t").and_then(Value::as_str) == Some("DEEP_SIMPLE_NO_RESULTS")
+            && ["u", "a"]
+                .iter()
+                .all(|key| row.get(*key).and_then(Value::as_str) == Some(""));
+        if no_results
+            || (!row.contains_key("u")
+                && row
+                    .get("n")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| provider_target(n, base, limits).is_ok()))
         {
+            if (no_results || !results.is_empty())
+                && rows[index + 1..]
+                    .iter()
+                    .all(|row| row.as_object().is_some_and(|row| row.is_empty()))
+            {
+                break;
+            }
             continue;
         }
         let href = row

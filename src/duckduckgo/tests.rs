@@ -135,6 +135,93 @@ fn pagination_sentinels_allow_metadata_without_discarding_organic_results() {
 }
 
 #[test]
+fn padded_short_result_sets_keep_all_usable_results() {
+    let found = results(
+        r#"{"results":[
+        {"u":"https://example.com/guide","t":"<b>Guide</b>","a":"First page."},
+        {"u":"https://example.com/reference","t":"Reference","a":"Second page."},
+        {"n":"/d.js?next=sample"},{},{},{},{}
+    ]}"#,
+    )
+    .unwrap();
+    let items: Vec<_> = found
+        .iter()
+        .map(|item| {
+            (
+                item.url.as_str(),
+                item.title.as_str(),
+                item.snippet.as_str(),
+                item.truncated,
+            )
+        })
+        .collect();
+    assert_eq!(
+        items,
+        vec![
+            ("https://example.com/guide", "Guide", "First page.", false),
+            (
+                "https://example.com/reference",
+                "Reference",
+                "Second page.",
+                false
+            ),
+        ]
+    );
+}
+
+#[test]
+fn explicit_no_results_marker_accepts_empty_padding_but_not_result_urls() {
+    for body in [
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":""}]}"#,
+        r#"{"deep_answers":{},"results":[
+            {"a":"","ae":null,"c":"","d":"","h":0,"i":"","k":"","m":0,"o":0,"p":"","t":"DEEP_SIMPLE_NO_RESULTS","u":""},
+            {},{},{},{},{},{}
+        ]}"#,
+    ] {
+        assert!(results(body).unwrap().is_empty());
+    }
+    let found = results(
+        r#"{"results":[{"u":"https://example.com/guide","t":"DEEP_SIMPLE_NO_RESULTS","a":"A real page."}]}"#,
+    )
+    .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].url.as_str(), "https://example.com/guide");
+    assert_eq!(found[0].title, "DEEP_SIMPLE_NO_RESULTS");
+    assert_eq!(found[0].snippet, "A real page.");
+}
+
+#[test]
+fn padding_does_not_hide_invalid_markers_or_rows() {
+    for body in [
+        r#"{"results":[{"t":"UNKNOWN_NO_RESULTS","u":"","a":""},{}]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","a":""},{}]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":null,"a":""},{}]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":"invalid","a":""},{}]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":""},{}]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":null},{}]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":"Not empty"},{}]}"#,
+        r#"{"results":[{}, {"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":""}]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":""},{},null]}"#,
+        r#"{"results":[{"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":""},{},{"unknown":true}]}"#,
+        r#"{"results":[{"u":"https://example.com/","t":"Guide"},{"n":"/d.js?next=sample"},{},null]}"#,
+        r#"{"results":[{"u":"https://example.com/","t":"Guide"},{"n":"/d.js?next=sample"},{},{"unknown":true}]}"#,
+        r#"{"results":[{"u":"https://example.com/","t":"Guide"},{"n":"https://example.com/d.js?next=sample"},{}]}"#,
+        r#"{"results":[{"u":"https://example.com/","t":"Guide"},{},{"n":"/d.js?next=sample"},{}]}"#,
+        r#"{"results":[{"u":"https://example.com/","t":" "},{"n":"/d.js?next=sample"},{}]}"#,
+        r#"{"results":[{"u":"https://127.0.0.1/","t":"Private"},{"n":"/d.js?next=sample"},{}]}"#,
+    ] {
+        assert_eq!(
+            results(body)
+                .err()
+                .expect("invalid response must fail")
+                .code,
+            ErrorCode::UpstreamFailed,
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn unusable_titles_preserve_results_and_do_not_hide_usable_duplicates() {
     let found = results(
         r#"{"results":[
