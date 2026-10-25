@@ -1,4 +1,4 @@
-use scry::{Config, ContentsRequest, ErrorCode, ItemStatus, Scry, SearchRequest};
+use scry::{Config, ContentsRequest, ErrorCode, ItemStatus, Limits, Scry, SearchRequest};
 use serde_json::json;
 
 #[test]
@@ -174,5 +174,29 @@ async fn metadata_contents_keeps_valid_items_and_explicit_item_errors_and_checks
             scry.contents(request).await.unwrap_err().code,
             ErrorCode::InvalidInput
         );
+    }
+}
+
+#[test]
+fn pdf_page_limit_enforces_documented_bounds() {
+    assert_eq!(Limits::default().max_pdf_pages, 200);
+    for value in [1, 200, 5000] {
+        let config = Config {
+            limits: Limits {
+                max_pdf_pages: value,
+                ..Limits::default()
+            },
+        };
+        assert!(config.validate().is_ok(), "{value}");
+    }
+    for value in [0, 5001] {
+        let config = Config {
+            limits: Limits {
+                max_pdf_pages: value,
+                ..Limits::default()
+            },
+        };
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput, "{value}");
     }
 }

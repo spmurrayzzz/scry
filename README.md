@@ -60,7 +60,7 @@ See [request and response types](src/api.rs) and [configurable limits](src/confi
 
 - Result IDs are normalized source URLs. Batches preserve order and per-URL failures.
 - Retrieval accepts public HTTP(S) destinations on standard ports. DNS addresses are validated and pinned. Redirects receive the same checks.
-- HTML/XHTML only. No JavaScript rendering, authenticated browsing, or PDF extraction.
+- Page retrieval accepts HTML, XHTML, plain text, markdown, JSON, and PDF. No JavaScript rendering or authenticated browsing.
 - `auto` and `keyword` both use keyword search. Neural search and publication-date filters are unsupported.
 
 The full contract is in [AGENTS.md](AGENTS.md).

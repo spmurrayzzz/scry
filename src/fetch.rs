@@ -39,12 +39,14 @@ pub(crate) struct Fetcher {
 pub(crate) enum PageKind {
     Html,
     Plain,
+    Pdf,
 }
 
 #[derive(Debug)]
 pub(crate) enum PageBody {
     Html(String),
     Plain(String),
+    Pdf(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -59,12 +61,19 @@ impl FetchedPage {
     pub(crate) fn as_text(&self) -> Option<&str> {
         match &self.body {
             PageBody::Html(text) | PageBody::Plain(text) => Some(text),
+            PageBody::Pdf(_) => None,
         }
     }
 
     pub(crate) fn into_parts(self) -> Result<(String, Url, Option<Error>), Error> {
         let text = match self.body {
             PageBody::Html(text) | PageBody::Plain(text) => text,
+            PageBody::Pdf(_) => {
+                return Err(Error::new(
+                    ErrorCode::Internal,
+                    "Provider responses cannot be PDF pages",
+                ));
+            }
         };
         Ok((text, self.final_url, self.status_error))
     }
@@ -120,7 +129,7 @@ impl Fetcher {
                         .get(url.clone())
                         .header(
                             ACCEPT,
-                            "text/html, application/xhtml+xml, text/plain, text/markdown, text/x-markdown, application/json",
+                            "text/html, application/xhtml+xml, text/plain, text/markdown, text/x-markdown, application/json, application/pdf",
                         )
                         .header(ACCEPT_ENCODING, "identity")
                         .header(CONNECTION, "close")
@@ -231,6 +240,11 @@ impl Fetcher {
                     } else {
                         PageBody::Plain(text)
                     }
+                }
+                PageKind::Pdf => {
+                    let bytes = self.read_pdf(response, ctx).await?;
+                    ctx.check()?;
+                    PageBody::Pdf(bytes)
                 }
             }
         };
@@ -403,6 +417,61 @@ impl Fetcher {
             })
     }
 
+    async fn read_pdf(
+        &self,
+        mut response: Response,
+        ctx: &RequestContext,
+    ) -> Result<Vec<u8>, Error> {
+        let expected_length = response.content_length();
+        let mut downloaded = 0usize;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let chunk = response.chunk().await.map_err(network_error)?;
+            ctx.check()?;
+            let last = chunk.is_none();
+            if last && expected_length.is_some_and(|length| length != downloaded as u64) {
+                return Err(Error::new(
+                    ErrorCode::UpstreamFailed,
+                    "Upstream closed an incomplete response",
+                ));
+            }
+            if let Some(chunk) = chunk {
+                let new_len = downloaded
+                    .checked_add(chunk.len())
+                    .ok_or_else(download_too_large)?;
+                if new_len > self.limits.max_download_bytes {
+                    return Err(download_too_large());
+                }
+                if new_len > bytes.capacity() {
+                    let capacity = bytes
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(new_len)
+                        .min(self.limits.max_download_bytes);
+                    bytes
+                        .try_reserve_exact(capacity - bytes.len())
+                        .map_err(|_| {
+                            Error::new(
+                                ErrorCode::Overloaded,
+                                "Cannot allocate memory for the PDF page",
+                            )
+                        })?;
+                }
+                bytes.extend_from_slice(&chunk);
+                downloaded = new_len;
+            } else {
+                break;
+            }
+        }
+        if bytes.is_empty() {
+            return Err(Error::new(
+                ErrorCode::UnsupportedContent,
+                "Upstream returned an empty page",
+            ));
+        }
+        Ok(bytes)
+    }
+
     async fn read_text(
         &self,
         response: Response,
@@ -539,7 +608,7 @@ fn response_kind_for(
 ) -> Result<(PageKind, Option<&'static Encoding>), Error> {
     let script = provider == Some(true);
     let unsupported = match provider {
-        None => "Only HTML, XHTML, plain text, markdown, and JSON pages are supported",
+        None => "Only HTML, XHTML, plain text, markdown, JSON, and PDF pages are supported",
         Some(true) => "Provider script responses must be HTML, XHTML, JSON, or JavaScript",
         Some(false) => "Provider website responses must be HTML or XHTML",
     };
@@ -577,6 +646,7 @@ fn response_kind_for(
             match kind.as_str() {
                 "text/html" | "application/xhtml+xml" => Some(PageKind::Html),
                 "application/json" => Some(PageKind::Plain),
+                "application/pdf" if !script => Some(PageKind::Pdf),
                 "text/plain" | "text/markdown" | "text/x-markdown" if !script => {
                     Some(PageKind::Plain)
                 }
@@ -593,6 +663,7 @@ fn response_kind_for(
         && !match kind {
             PageKind::Html => true,
             PageKind::Plain => script,
+            PageKind::Pdf => false,
         }
     {
         return Err(Error::new(ErrorCode::UnsupportedContent, unsupported));

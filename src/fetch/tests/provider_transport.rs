@@ -286,13 +286,6 @@ async fn provider_bodies_keep_download_decoding_and_encoding_limits() {
                 20,
                 Err(ErrorCode::UnsupportedContent),
             ),
-            (
-                "Content-Type: application/pdf\r\n",
-                vec![b"%PDF".as_slice()],
-                20,
-                20,
-                Err(ErrorCode::UnsupportedContent),
-            ),
         ] {
             let limits = Limits {
                 max_download_bytes: download_limit,

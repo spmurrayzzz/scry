@@ -305,7 +305,6 @@ async fn body_decoder_keeps_charset_state_across_chunks_after_sniff_prefix() {
 async fn body_decoder_rejects_unsupported_mime_charset_and_content_encoding() {
     for headers in [
         "",
-        "Content-Type: application/pdf\r\n",
         "Content-Type: application/octet-stream\r\n",
         "Content-Type: text/html; charset=not-a-charset\r\n",
         "Content-Type: text/html; charset=replacement\r\n",
@@ -371,6 +370,100 @@ async fn body_decoder_accepts_plain_text_markdown_and_json_types() {
         .unwrap(),
         "<meta charset=windows-1252>\u{fffd}"
     );
+}
+
+#[tokio::test]
+async fn read_response_routes_pdf_bodies_to_raw_bytes() {
+    let fetcher = fetcher(Limits::default());
+    let (response, mut server, ctx) = response(
+        &fetcher,
+        "200 OK",
+        "Content-Type: application/pdf\r\nContent-Length: 5\r\n",
+        false,
+        &[b"%PDF-".as_slice()],
+    )
+    .await;
+    let page = fetcher
+        .read_response(
+            response,
+            Url::parse("http://pinned.invalid/page").unwrap(),
+            None,
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PageBody::Pdf(bytes) = page.body else {
+        panic!("expected a PDF body");
+    };
+    assert_eq!(bytes, b"%PDF-");
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn pdf_content_type_is_rejected_at_provider_script_stages() {
+    let fetcher = fetcher(Limits::default());
+    let (response, mut server, _) = response(
+        &fetcher,
+        "200 OK",
+        "Content-Type: application/pdf\r\n",
+        false,
+        &[b"%PDF-".as_slice()],
+    )
+    .await;
+    assert_eq!(
+        response_kind_for(&response, Some(true)).unwrap_err().code,
+        ErrorCode::UnsupportedContent
+    );
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn provider_stages_reject_pdf_responses_before_body_read() {
+    struct PoisonBody;
+
+    impl hyper::body::Body for PoisonBody {
+        type Data = hyper::body::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            panic!("The response body must not be read");
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::with_exact(4)
+        }
+    }
+
+    let fetcher = fetcher(Limits::default());
+    for (script, message) in [
+        (false, "Provider website responses must be HTML or XHTML"),
+        (
+            true,
+            "Provider script responses must be HTML, XHTML, JSON, or JavaScript",
+        ),
+    ] {
+        let response = http::Response::builder()
+            .status(200)
+            .header("Content-Type", "application/pdf")
+            .header("Content-Length", "4")
+            .body(reqwest::Body::wrap(PoisonBody))
+            .unwrap()
+            .into();
+        let error = fetcher
+            .read_response(
+                response,
+                Url::parse("https://example.com/page").unwrap(),
+                Some(script),
+                &RequestContext::new(BUDGET),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedContent, "{script}");
+        assert_eq!(error.message, message, "{script}");
+    }
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # scry
 
-`scry` is a small self-hosted Rust service for agent web search and page reading. One binary provides a CLI, a REST API, and MCP over stdio or Streamable HTTP. Search finds URLs through the DuckDuckGo website and its JSON results script. Page reading gets public HTML pages and raw text, markdown, and JSON documents, and returns bounded text and highlights.
+`scry` is a small self-hosted Rust service for agent web search and page reading. One binary provides a CLI, a REST API, and MCP over stdio or Streamable HTTP. Search finds URLs through the DuckDuckGo website and its JSON results script. Page reading gets public HTML pages and raw text, markdown, JSON, and PDF documents, and returns bounded text and highlights.
 
 DuckDuckGo access is unofficial. The service can be blocked, challenged, or rate limited. Report these conditions as errors. Never report them as an empty result set.
 
@@ -23,6 +23,7 @@ The tool interface follows the Exa search and contents pattern. Exa, Firecrawl, 
 - `src/mcp.rs`: shared MCP handler, tool schemas, and HTTP session management.
 - `src/stdio.rs`: bounded stdio MCP transport and shutdown handling.
 - `src/main.rs`: CLI, runtime lifecycle, and exit codes.
+- `src/pdf.rs`: bounded PDF text extraction through liteparse.
 - `src/*/tests.rs`: module tests for parser, retrieval, policy, and service boundaries.
 - `tests/library.rs`: public library contracts.
 - `tests/interfaces.rs`: real CLI, REST, and MCP process tests.
@@ -140,7 +141,9 @@ An absolute executable path can replace `scry`. Do not put machine-specific path
 - DNS configuration reads run as blocking tasks, with at most `max_fetches` outstanding reads shared across fetcher clones. Each task retains its permit until completion, even after request cancellation or timeout. Admission, configuration reading, and DNS queries share one DNS deadline within the fetch and request deadlines. DNS timeouts return `timeout`; cancellation takes precedence.
 - DNS ignores the hosts file and disables caching. The service validates all returned addresses and pins them to a per-request client. The connection target cannot change after validation. IP literals skip DNS configuration reads but receive the same destination checks.
 - The service follows 301, 302, 303, 307, and 308 redirects. Each redirect receives URL syntax, length, domain, DNS, TLS, and downgrade checks. Redirect counts are bounded, and each redirect must have exactly one valid Location header. Search redirects must also stay within the strict provider endpoint for the current stage.
-- Only identity content encoding is accepted. Page retrieval accepts HTML, XHTML, plain text, markdown, and JSON. The website bootstrap accepts only HTML and XHTML. The scoped results-script stage accepts HTML, XHTML, JSON, and JavaScript media types. Plain text, markdown, and JSON bypass HTML extraction and return bounded raw text. Character sets come from a BOM, the header, or, for HTML only, a bounded meta sniff. Decoding is bounded. An incomplete response with a declared length is an error.
+- Only identity content encoding is accepted. Page retrieval accepts HTML, XHTML, plain text, markdown, JSON, and PDF. The website bootstrap accepts only HTML and XHTML. The scoped results-script stage accepts HTML, XHTML, JSON, and JavaScript media types. Plain text, markdown, and JSON bypass HTML extraction and return bounded raw text. Character sets come from a BOM, the header, or, for HTML only, a bounded meta sniff. Decoding is bounded. An incomplete response with a declared length is an error.
+- PDF pages are downloaded as bounded raw bytes and must classify as PDF before parsing; anything else is rejected before liteparse sees it. OCR is disabled and the page count is bounded by `max_pdf_pages`. Parsing is local and offline. liteparse accumulates the full document text internally, so memory growth is bounded by the download and page limits rather than the decoded-byte limit. A cancelled or expired parse keeps its parser slot until the native parse returns, and PDFium serializes parses behind a process-global lock. A PDF without a readable text layer is an error; scanned pages are not recognized.
+- PDF parsing links a prebuilt PDFium shared library. The `liteparse-pdfium-sys` build script downloads it from run-llama/pdfium-binaries unless both `PDFIUM_LIB_PATH` and `PDFIUM_INCLUDE_PATH` are set. Set both to pin a vetted copy. Build-time library selection is separate from the runtime library load, which resolves the dylib from the baked build path or the loader search path.
 - Requests send no cookies, authorization, or proxy credentials. Page retrieval uses Reqwest, HTTP/1.1, connection close, and no Referer.
 - Search starts with GET `https://duckduckgo.com/?q=...&t=h_&ia=web`. The bounded parser extracts the server-provided `deep_preload_link` and adds `o=json`. The service retrieves that script and parses its `results` array. It does not construct server tokens, paginate, cache, or fall back to the old HTML backend or another engine.
 - Search accepts the `DEEP_SIMPLE_NO_RESULTS` marker only with empty `u` and `a` fields. Empty trailing objects are padding only after this marker, or after a validated pagination marker following usable results. Other malformed rows remain `upstream_failed`.
@@ -174,6 +177,7 @@ The defaults are in `src/config.rs`. `Limits::validate` rejects zero and enforce
 | Response bytes | 1048576 | 16777216 |
 | Redirects | 5 | 20 |
 | HTML tokens | 100000 | 2000000 |
+| PDF pages | 200 | 5000 |
 | HTML depth | 128 | 1024 |
 | Concurrent requests | 20 | 1024 |
 | Concurrent fetches | 8 | 1024 |
@@ -217,7 +221,7 @@ One successful request does not prove throughput, availability, or search qualit
 - The DuckDuckGo website/JSON workflow is the production search backend. Keep one search backend. Ask before you change the source.
 - Defer these items until a demonstrated need and approval exist:
   - browser automation and authenticated browsing
-  - PDFs and media extraction
+  - media extraction
   - site crawls and background queues
   - persistent caching
   - search indexes, vector databases, embeddings, and LLM summaries

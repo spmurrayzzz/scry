@@ -19,6 +19,7 @@ use crate::context::RequestContext;
 use crate::duckduckgo::{self, DiscoveredResult};
 use crate::extract;
 use crate::fetch::{Fetcher, PageBody};
+use crate::pdf;
 use crate::policy::{self, DomainFilter};
 
 #[cfg(test)]
@@ -546,6 +547,7 @@ impl Scry {
                 PageBody::Plain(text) => {
                     extract::extract_plain(text, query.as_deref(), ctx, limits)
                 }
+                PageBody::Pdf(bytes) => pdf::extract(bytes, query.as_deref(), ctx, limits),
             })
             .await
         }

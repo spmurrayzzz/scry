@@ -1782,6 +1782,9 @@ fn provider_query_applies_domain_operators_or_warns_without_cutting_the_base_que
     assert!(warnings.iter().any(|warning| warning.contains("locally")));
 }
 
+use lopdf::content::{Content, Operation};
+use lopdf::{Document, Object, Stream, dictionary};
+
 struct KindCase {
     media: &'static str,
     body: Vec<u8>,
@@ -1797,6 +1800,57 @@ fn media_response(media: &str, body: reqwest::Body) -> reqwest::Response {
         .body(body)
         .unwrap()
         .into()
+}
+
+fn pdf_fixture(text: &str) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content = Content {
+        operations: vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 12.into()]),
+            Operation::new("Td", vec![20.into(), 100.into()]),
+            Operation::new("Tj", vec![text.into()]),
+            Operation::new("ET", vec![]),
+        ],
+    };
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(200),
+            Object::Integer(200),
+        ],
+        "Contents" => Object::Reference(content_id),
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+        },
+    });
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => Object::Integer(1),
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
 }
 
 #[tokio::test]
@@ -1846,6 +1900,13 @@ async fn enrich_routes_all_supported_body_kinds() {
             exact: true,
             title: None,
         },
+        KindCase {
+            media: "application/pdf",
+            body: pdf_fixture("hello pdf"),
+            expected: "hello pdf".to_owned(),
+            exact: false,
+            title: None,
+        },
     ];
     for KindCase {
         media,
@@ -1893,7 +1954,10 @@ async fn enrich_failures_preserve_search_metadata() {
         include_text: true,
         include_highlights: false,
     };
-    for (media, body) in [("application/octet-stream", &b"binary"[..])] {
+    for (media, body) in [
+        ("application/octet-stream", &b"binary"[..]),
+        ("application/pdf", &b"%PDF-1.4 junk"[..]),
+    ] {
         let url = Url::parse("https://example.com/page").unwrap();
         let mut result = metadata(url.as_str().to_owned());
         result.title = Some("Result title".into());

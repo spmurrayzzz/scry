@@ -4,6 +4,7 @@ pub mod context;
 pub mod duckduckgo;
 pub mod extract;
 pub mod fetch;
+pub mod pdf;
 pub mod policy;
 pub mod service;
 
