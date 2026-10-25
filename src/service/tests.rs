@@ -115,7 +115,7 @@ async fn script_202_captured_wrapper_follows_the_literal_answer_once() {
             async move {
                 let page = read.await?;
                 if status == 202 {
-                    assert_eq!(page.html, CHALLENGE);
+                    assert_eq!(page.as_text(), Some(CHALLENGE));
                     assert_eq!(
                         page.status_error.as_ref().unwrap().code,
                         ErrorCode::UpstreamBlocked
@@ -195,7 +195,7 @@ async fn script_202_captured_wrapper_keeps_status_at_parser_wait_deadline_withou
             async move {
                 let page = read.await?;
                 if status == 202 {
-                    assert_eq!(page.html, CHALLENGE);
+                    assert_eq!(page.as_text(), Some(CHALLENGE));
                     assert_eq!(
                         page.status_error.as_ref().unwrap().code,
                         ErrorCode::UpstreamBlocked
@@ -505,10 +505,12 @@ async fn provider_web_workflow_keeps_one_lock_and_pipeline_through_results_or_on
                 std::future::ready(Ok(crate::fetch::FetchedPage {
                     final_url: url,
                     status_error: None,
-                    html: bodies
-                        .pop_front()
-                        .expect("Unexpected protocol request")
-                        .into(),
+                    body: crate::fetch::PageBody::Html(
+                        bodies
+                            .pop_front()
+                            .expect("Unexpected protocol request")
+                            .into(),
+                    ),
                 }))
             })
             .await
@@ -590,10 +592,12 @@ async fn provider_web_quoted_queries_accept_padded_short_and_empty_results() {
                 std::future::ready(Ok(crate::fetch::FetchedPage {
                     final_url: url,
                     status_error: None,
-                    html: bodies
-                        .pop_front()
-                        .expect("Unexpected protocol request")
-                        .into(),
+                    body: crate::fetch::PageBody::Html(
+                        bodies
+                            .pop_front()
+                            .expect("Unexpected protocol request")
+                            .into(),
+                    ),
                 }))
             })
             .await
@@ -635,10 +639,12 @@ async fn provider_web_rejects_image_unknown_and_repeated_challenges_without_more
                 std::future::ready(Ok(crate::fetch::FetchedPage {
                     final_url: url,
                     status_error: None,
-                    html: bodies
-                        .pop_front()
-                        .expect("Unexpected challenge follow")
-                        .into(),
+                    body: crate::fetch::PageBody::Html(
+                        bodies
+                            .pop_front()
+                            .expect("Unexpected challenge follow")
+                            .into(),
+                    ),
                 }))
             })
             .await
@@ -691,7 +697,9 @@ async fn provider_web_every_fetch_stage_finishes_known_status_and_retry_even_at_
                             Ok(crate::fetch::FetchedPage {
                                 final_url: url,
                                 status_error: None,
-                                html: [WEB_BOOTSTRAP, WEB_CHALLENGE][stage].into(),
+                                body: crate::fetch::PageBody::Html(
+                                    [WEB_BOOTSTRAP, WEB_CHALLENGE][stage].into(),
+                                ),
                             })
                         }
                     }
@@ -744,7 +752,9 @@ async fn provider_web_stage_cancellation_completes_without_adding_or_resetting_b
                     Ok(crate::fetch::FetchedPage {
                         final_url: url,
                         status_error: None,
-                        html: [WEB_BOOTSTRAP, WEB_CHALLENGE][stage].into(),
+                        body: crate::fetch::PageBody::Html(
+                            [WEB_BOOTSTRAP, WEB_CHALLENGE][stage].into(),
+                        ),
                     })
                 })
             })
@@ -778,7 +788,7 @@ async fn provider_web_parser_wait_cancellation_releases_the_pipeline_and_provide
         std::future::ready(Ok(crate::fetch::FetchedPage {
             final_url: url,
             status_error: None,
-            html: WEB_BOOTSTRAP.into(),
+            body: crate::fetch::PageBody::Html(WEB_BOOTSTRAP.into()),
         }))
     }));
     assert!(futures_util::poll!(pending.as_mut()).is_pending());
@@ -1770,4 +1780,187 @@ fn provider_query_applies_domain_operators_or_warns_without_cutting_the_base_que
     request.exclude_domains.clear();
     assert_eq!(provider_query(&request, 499, &mut warnings), "builder");
     assert!(warnings.iter().any(|warning| warning.contains("locally")));
+}
+
+struct KindCase {
+    media: &'static str,
+    body: Vec<u8>,
+    expected: String,
+    exact: bool,
+    title: Option<&'static str>,
+}
+
+fn media_response(media: &str, body: reqwest::Body) -> reqwest::Response {
+    http::Response::builder()
+        .status(200)
+        .header("Content-Type", media)
+        .body(body)
+        .unwrap()
+        .into()
+}
+
+#[tokio::test]
+async fn enrich_routes_all_supported_body_kinds() {
+    let scry = Scry::new(Config::default()).unwrap();
+    let ctx = scry.context();
+    let fetcher = scry.inner.fetcher.clone();
+    let options = ContentOptions {
+        query: None,
+        include_text: true,
+        include_highlights: true,
+    };
+    let html = "<html><head><title>Doc</title></head><body><p>hello html</p></body></html>";
+    let cases = vec![
+        KindCase {
+            media: "text/html",
+            body: html.as_bytes().to_vec(),
+            expected: "hello html".to_owned(),
+            exact: false,
+            title: Some("Doc"),
+        },
+        KindCase {
+            media: "text/plain",
+            body: b"hello plain".to_vec(),
+            expected: "hello plain".to_owned(),
+            exact: true,
+            title: None,
+        },
+        KindCase {
+            media: "text/markdown",
+            body: b"# hello md".to_vec(),
+            expected: "# hello md".to_owned(),
+            exact: true,
+            title: None,
+        },
+        KindCase {
+            media: "text/x-markdown",
+            body: b"# hello xmd".to_vec(),
+            expected: "# hello xmd".to_owned(),
+            exact: true,
+            title: None,
+        },
+        KindCase {
+            media: "application/json",
+            body: b"{\"k\":\"v\"}".to_vec(),
+            expected: "{\"k\":\"v\"}".to_owned(),
+            exact: true,
+            title: None,
+        },
+    ];
+    for KindCase {
+        media,
+        body,
+        expected,
+        exact,
+        title,
+    } in cases
+    {
+        let url = Url::parse("https://example.com/page").unwrap();
+        let result = scry
+            .enrich_with(
+                metadata(url.as_str().to_owned()),
+                url,
+                &DomainFilter::default(),
+                options,
+                &ctx,
+                |url| {
+                    let ctx = &ctx;
+                    let response = media_response(media, reqwest::Body::from(body.clone()));
+                    let fetcher = fetcher.clone();
+                    async move { fetcher.read_response(response, url, None, ctx).await }
+                },
+            )
+            .await;
+        assert_eq!(result.status, ItemStatus::Ok, "{media}");
+        assert_eq!(result.content_origin, Some(ContentOrigin::Live), "{media}");
+        assert_eq!(result.title.as_deref(), title, "{media}");
+        let text = result.text.as_deref().unwrap();
+        if exact {
+            assert_eq!(text, expected, "{media}");
+        } else {
+            assert!(text.contains(&expected), "{media}: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn enrich_failures_preserve_search_metadata() {
+    let scry = Scry::new(Config::default()).unwrap();
+    let ctx = scry.context();
+    let fetcher = scry.inner.fetcher.clone();
+    let options = ContentOptions {
+        query: None,
+        include_text: true,
+        include_highlights: false,
+    };
+    for (media, body) in [("application/octet-stream", &b"binary"[..])] {
+        let url = Url::parse("https://example.com/page").unwrap();
+        let mut result = metadata(url.as_str().to_owned());
+        result.title = Some("Result title".into());
+        result.snippet = Some("Result snippet".into());
+        let result = scry
+            .enrich_with(
+                result,
+                url,
+                &DomainFilter::default(),
+                options,
+                &ctx,
+                |url| {
+                    let ctx = &ctx;
+                    let response = media_response(media, reqwest::Body::from(body.to_vec()));
+                    let fetcher = fetcher.clone();
+                    async move { fetcher.read_response(response, url, None, ctx).await }
+                },
+            )
+            .await;
+        assert_eq!(result.status, ItemStatus::Partial, "{media}");
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            ErrorCode::UnsupportedContent,
+            "{media}"
+        );
+        assert_eq!(result.snippet.as_deref(), Some("Result snippet"), "{media}");
+        assert_eq!(result.title.as_deref(), Some("Result title"), "{media}");
+        assert!(result.text.is_none(), "{media}");
+    }
+}
+
+#[tokio::test]
+async fn enrich_cancellation_returns_promptly_and_keeps_permits_accounted() {
+    let scry = Scry::new(Config::default()).unwrap();
+    let ctx = scry.context();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let gated = gate.clone();
+    let fetcher = scry.inner.fetcher.clone();
+    let url = Url::parse("https://example.com/page").unwrap();
+    let filter = DomainFilter::default();
+    let mut pending = Box::pin(scry.enrich_with(
+        metadata(url.as_str().to_owned()),
+        url,
+        &filter,
+        ContentOptions {
+            query: None,
+            include_text: true,
+            include_highlights: false,
+        },
+        &ctx,
+        |url| {
+            let ctx = &ctx;
+            let gate = gated.clone();
+            let fetcher = fetcher.clone();
+            async move {
+                gate.notified().await;
+                let response = media_response("text/plain", reqwest::Body::from("blocked"));
+                fetcher.read_response(response, url, None, ctx).await
+            }
+        },
+    ));
+    assert!(futures_util::poll!(pending.as_mut()).is_pending());
+    let max_fetches = scry.config().limits.max_fetches;
+    assert_eq!(scry.inner.pipeline.available_permits(), max_fetches - 1);
+    ctx.cancellation.cancel();
+    let result = pending.await;
+    assert_eq!(result.status, ItemStatus::Error);
+    assert_eq!(result.error.unwrap().code, ErrorCode::Cancelled);
+    assert_eq!(scry.inner.pipeline.available_permits(), max_fetches);
 }

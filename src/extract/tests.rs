@@ -471,3 +471,55 @@ fn cooperative_reader_observes_cancellation_after_reading_begins() {
     assert_eq!(error.code, ErrorCode::Cancelled);
     assert!(!reader.input.is_empty());
 }
+
+#[test]
+fn plain_extraction_keeps_text_verbatim_without_html_parsing() {
+    let page = extract_plain(
+        "a < b && c > d\n```rust\nlet x = 1;\n```\n",
+        None,
+        &context(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(page.title, None);
+    assert_eq!(page.text, "a < b && c > d\n```rust\nlet x = 1;\n```\n");
+    assert_eq!(
+        page.highlights,
+        vec!["a < b && c > d\n```rust\nlet x = 1;\n```".to_owned()]
+    );
+    assert!(!page.truncated);
+}
+
+#[test]
+fn plain_extraction_preserves_leading_indentation() {
+    let page = extract_plain(
+        "    indented code\nsecond\n",
+        None,
+        &context(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(page.text, "    indented code\nsecond\n");
+    assert!(!page.truncated);
+}
+
+#[test]
+fn plain_extraction_truncates_at_the_text_limit() {
+    let limits = Limits {
+        max_text_chars: 20,
+        ..Limits::default()
+    };
+    let source = "0123456789012345678901234567890";
+    let page = extract_plain(source, None, &context(), &limits).unwrap();
+    assert_eq!(page.highlights, vec!["01234".to_owned()]);
+    assert_eq!(page.text, "012345678901234");
+    assert!(page.truncated);
+}
+
+#[test]
+fn plain_extraction_rejects_blank_text() {
+    let error = extract_plain("   \n\t", None, &context(), &Limits::default())
+        .err()
+        .unwrap();
+    assert_eq!(error.code, ErrorCode::ExtractionFailed);
+}

@@ -214,7 +214,7 @@ async fn script_202_reader_only_defers_the_scoped_script_status_and_keeps_the_bo
             .await;
         let error = if accepted {
             let page = result.unwrap();
-            assert_eq!(page.html, "body-secret");
+            assert_eq!(page.as_text(), Some("body-secret"));
             assert_eq!(page.final_url.as_str(), url);
             page.status_error.unwrap()
         } else {
@@ -567,9 +567,12 @@ async fn provider_diagnostics_leave_successful_bodies_for_the_normal_parser() {
     )
     .await
     .unwrap();
-    let encoding = response_encoding(&response).unwrap();
+    let (kind, encoding) = response_kind_for(&response, None).unwrap();
     assert_eq!(
-        fetcher.read_html(response, encoding, &ctx).await.unwrap(),
+        fetcher
+            .read_text(response, kind, encoding, &ctx)
+            .await
+            .unwrap(),
         IMAGE_CHALLENGE
     );
     server.finish().await;

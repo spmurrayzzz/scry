@@ -18,7 +18,7 @@ use crate::config::{Config, Limits};
 use crate::context::RequestContext;
 use crate::duckduckgo::{self, DiscoveredResult};
 use crate::extract;
-use crate::fetch::Fetcher;
+use crate::fetch::{Fetcher, PageBody};
 use crate::policy::{self, DomainFilter};
 
 #[cfg(test)]
@@ -443,17 +443,18 @@ impl Scry {
         provider.started();
         let mut discovered = async {
             let page = fetch(duckduckgo::web_url(&query)?, false).await?;
+            let (bootstrap, bootstrap_url, _) = page.into_parts()?;
             let mut url = self
                 .parse(ctx, pipeline_permit.clone(), move |ctx, limits| {
-                    duckduckgo::preload_url(&page.html, &page.final_url, ctx, limits)
+                    duckduckgo::preload_url(&bootstrap, &bootstrap_url, ctx, limits)
                 })
                 .await?;
             for follow in 0..2 {
                 let page = fetch(url, true).await?;
-                let status_error = page.status_error;
+                let (script, script_url, status_error) = page.into_parts()?;
                 let parsed = self
                     .parse(ctx, pipeline_permit.clone(), move |ctx, limits| {
-                        duckduckgo::web_results(&page.html, &page.final_url, ctx, limits)
+                        duckduckgo::web_results(&script, &script_url, ctx, limits)
                     })
                     .await
                     .map_err(|error| status_error.clone().unwrap_or(error))?;
@@ -498,12 +499,33 @@ impl Scry {
 
     async fn enrich(
         &self,
-        mut result: SearchResult,
+        result: SearchResult,
         url: Url,
         filter: &DomainFilter,
         options: ContentOptions<'_>,
         ctx: &RequestContext,
     ) -> SearchResult {
+        let fetcher = self.inner.fetcher.clone();
+        self.enrich_with(result, url, filter, options, ctx, |url| {
+            let fetcher = fetcher.clone();
+            async move { fetcher.get(url, filter, ctx).await }
+        })
+        .await
+    }
+
+    async fn enrich_with<F, Fut>(
+        &self,
+        mut result: SearchResult,
+        url: Url,
+        filter: &DomainFilter,
+        options: ContentOptions<'_>,
+        ctx: &RequestContext,
+        mut fetch: F,
+    ) -> SearchResult
+    where
+        F: FnMut(Url) -> Fut,
+        Fut: Future<Output = Result<crate::fetch::FetchedPage, Error>>,
+    {
         let extracted = async {
             filter.check(&url)?;
             let pipeline_permit = Arc::new(
@@ -511,12 +533,19 @@ impl Scry {
                     .await?
                     .map_err(|_| Error::new(ErrorCode::Internal, "Pipeline limiter closed"))?,
             );
-            let page = within(ctx, self.inner.fetcher.get(url, filter, ctx)).await??;
+            let page = within(ctx, fetch(url)).await??;
             filter.check(&page.final_url)?;
             result.final_url = Some(page.final_url.as_str().to_owned());
             let query = options.query.map(str::to_owned);
-            self.parse(ctx, pipeline_permit, move |ctx, limits| {
-                extract::extract(&page.html, &page.final_url, query.as_deref(), ctx, limits)
+            let body = page.body;
+            let base = page.final_url;
+            self.parse(ctx, pipeline_permit, move |ctx, limits| match &body {
+                PageBody::Html(html) => {
+                    extract::extract(html, &base, query.as_deref(), ctx, limits)
+                }
+                PageBody::Plain(text) => {
+                    extract::extract_plain(text, query.as_deref(), ctx, limits)
+                }
             })
             .await
         }

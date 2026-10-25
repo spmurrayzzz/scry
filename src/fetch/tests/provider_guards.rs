@@ -260,7 +260,6 @@ fn ordinary_redirects_keep_domain_filter_and_downgrade_checks() {
 async fn script_media_exception_is_scoped_and_keeps_the_shared_bounded_decoder() {
     let fetcher = fetcher(Limits::default());
     for kind in [
-        "application/json",
         "application/javascript",
         "text/javascript",
         "application/x-javascript",
@@ -274,16 +273,36 @@ async fn script_media_exception_is_scoped_and_keeps_the_shared_bounded_decoder()
         )
         .await;
         assert_eq!(
-            response_encoding_for(&response, false).unwrap_err().code,
+            response_kind_for(&response, None).unwrap_err().code,
             ErrorCode::UnsupportedContent
         );
-        let encoding = response_encoding_for(&response, true).unwrap();
+        let (kind, encoding) = response_kind_for(&response, Some(true)).unwrap();
         assert_eq!(
-            fetcher.read_html(response, encoding, &ctx).await.unwrap(),
+            fetcher
+                .read_text(response, kind, encoding, &ctx)
+                .await
+                .unwrap(),
             "{\"results\":[]}"
         );
         server.finish().await;
     }
+    let (json_response, mut server, ctx) = response(
+        &fetcher,
+        "200 OK",
+        "Content-Type: application/json; charset=utf-8\r\n",
+        true,
+        &[b"{\"results\":[]}"],
+    )
+    .await;
+    let (kind, encoding) = response_kind_for(&json_response, None).unwrap();
+    assert_eq!(
+        fetcher
+            .read_text(json_response, kind, encoding, &ctx)
+            .await
+            .unwrap(),
+        "{\"results\":[]}"
+    );
+    server.finish().await;
     for headers in [
         "Content-Type: text/plain\r\n",
         "Content-Type: application/json\r\nContent-Encoding: gzip\r\n",
@@ -292,7 +311,7 @@ async fn script_media_exception_is_scoped_and_keeps_the_shared_bounded_decoder()
     ] {
         let (response, mut server, _) = response(&fetcher, "200 OK", headers, true, &[b"{}"]).await;
         assert_eq!(
-            response_encoding_for(&response, true).unwrap_err().code,
+            response_kind_for(&response, Some(true)).unwrap_err().code,
             ErrorCode::UnsupportedContent
         );
         server.finish().await;
@@ -309,10 +328,10 @@ async fn script_media_exception_is_scoped_and_keeps_the_shared_bounded_decoder()
         &[b"{}x"],
     )
     .await;
-    let encoding = response_encoding_for(&response, true).unwrap();
+    let (kind, encoding) = response_kind_for(&response, Some(true)).unwrap();
     assert_eq!(
         bounded
-            .read_html(response, encoding, &ctx)
+            .read_text(response, kind, encoding, &ctx)
             .await
             .unwrap_err()
             .code,

@@ -4,8 +4,8 @@ use std::time::Duration;
 use reqwest::Response;
 use url::Url;
 
-use super::{Fetcher, network_error, response_encoding_for};
-use crate::api::Error;
+use super::{Fetcher, PageKind, network_error, response_kind_for};
+use crate::api::{Error, ErrorCode};
 use crate::config::Limits;
 use crate::context::RequestContext;
 use crate::extract::{challenge_screen, parse};
@@ -34,14 +34,14 @@ pub(super) async fn read_continuation(
         ..fetcher.limits.clone()
     };
     let reading = async {
-        let encoding = response_encoding_for(&response, true)?;
+        let (kind, encoding) = response_kind_for(&response, Some(true))?;
         if response
             .content_length()
             .is_some_and(|size| size > limits.max_download_bytes as u64)
         {
             return Err(super::download_too_large());
         }
-        Fetcher::read_html_bounded(response, encoding, &limits, &body_ctx).await
+        Fetcher::read_text_bounded(response, kind, encoding, &limits, &body_ctx).await
     };
     let result = tokio::select! {
         biased;
@@ -100,7 +100,13 @@ async fn classify(
     limits: &Limits,
     ctx: &RequestContext,
 ) -> Result<&'static str, Error> {
-    let encoding = response_encoding_for(&response, false)?;
+    let (kind, encoding) = response_kind_for(&response, None)?;
+    if kind != PageKind::Html {
+        return Err(Error::new(
+            ErrorCode::UnsupportedContent,
+            "Only HTML and XHTML pages are supported",
+        ));
+    }
     let limits = Limits {
         max_download_bytes: limits.max_download_bytes.min(DIAGNOSTIC_BYTES),
         max_decoded_bytes: limits.max_decoded_bytes.min(DIAGNOSTIC_BYTES),
@@ -114,7 +120,7 @@ async fn classify(
     {
         return Err(super::download_too_large());
     }
-    let html = Fetcher::read_html_bounded(response, encoding, &limits, ctx).await?;
+    let html = Fetcher::read_text_bounded(response, kind, encoding, &limits, ctx).await?;
     let doc = parse(&html, ctx, &limits)?;
     if !challenge_screen(&doc, url, ctx, &limits)? {
         return Ok("; DuckDuckGo response: unclassified");

@@ -35,11 +35,39 @@ pub(crate) struct Fetcher {
     semaphore: Arc<Semaphore>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageKind {
+    Html,
+    Plain,
+}
+
+#[derive(Debug)]
+pub(crate) enum PageBody {
+    Html(String),
+    Plain(String),
+}
+
 #[derive(Debug)]
 pub(crate) struct FetchedPage {
     pub final_url: Url,
-    pub html: String,
+    pub body: PageBody,
     pub status_error: Option<Error>,
+}
+
+impl FetchedPage {
+    #[cfg(test)]
+    pub(crate) fn as_text(&self) -> Option<&str> {
+        match &self.body {
+            PageBody::Html(text) | PageBody::Plain(text) => Some(text),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> Result<(String, Url, Option<Error>), Error> {
+        let text = match self.body {
+            PageBody::Html(text) | PageBody::Plain(text) => text,
+        };
+        Ok((text, self.final_url, self.status_error))
+    }
 }
 
 impl Fetcher {
@@ -90,7 +118,10 @@ impl Fetcher {
                     let client = self.client(&url, addresses, &ctx)?;
                     client
                         .get(url.clone())
-                        .header(ACCEPT, "text/html, application/xhtml+xml")
+                        .header(
+                            ACCEPT,
+                            "text/html, application/xhtml+xml, text/plain, text/markdown, text/x-markdown, application/json",
+                        )
                         .header(ACCEPT_ENCODING, "identity")
                         .header(CONNECTION, "close")
                         .send()
@@ -179,25 +210,33 @@ impl Fetcher {
         } else {
             None
         };
-        let html = if let Some(error) = &status_error {
-            provider::read_continuation(self, response, error, ctx).await?
+        let body = if let Some(error) = &status_error {
+            PageBody::Plain(provider::read_continuation(self, response, error, ctx).await?)
         } else {
             let response = provider::check_response(self, response, &url, provider, ctx).await?;
             ctx.check()?;
-            let encoding = response_encoding_for(&response, provider == Some(true))?;
+            let (kind, encoding) = response_kind_for(&response, provider)?;
             if response
                 .content_length()
                 .is_some_and(|size| size > self.limits.max_download_bytes as u64)
             {
                 return Err(download_too_large());
             }
-            let html = self.read_html(response, encoding, ctx).await?;
-            ctx.check()?;
-            html
+            match kind {
+                PageKind::Html | PageKind::Plain => {
+                    let text = self.read_text(response, kind, encoding, ctx).await?;
+                    ctx.check()?;
+                    if kind == PageKind::Html {
+                        PageBody::Html(text)
+                    } else {
+                        PageBody::Plain(text)
+                    }
+                }
+            }
         };
         Ok(FetchedPage {
             final_url: url,
-            html,
+            body,
             status_error,
         })
     }
@@ -364,17 +403,19 @@ impl Fetcher {
             })
     }
 
-    async fn read_html(
+    async fn read_text(
         &self,
         response: Response,
+        kind: PageKind,
         encoding: Option<&'static Encoding>,
         ctx: &RequestContext,
     ) -> Result<String, Error> {
-        Self::read_html_bounded(response, encoding, &self.limits, ctx).await
+        Self::read_text_bounded(response, kind, encoding, &self.limits, ctx).await
     }
 
-    async fn read_html_bounded(
+    async fn read_text_bounded(
         mut response: Response,
+        kind: PageKind,
         encoding: Option<&'static Encoding>,
         limits: &Limits,
         ctx: &RequestContext,
@@ -384,7 +425,7 @@ impl Fetcher {
         let mut prefix = [0u8; MAX_CHARSET_SNIFF_BYTES];
         let mut prefix_len = 0;
         let mut decoder = None;
-        let mut html = String::new();
+        let mut text = String::new();
         loop {
             let chunk = response.chunk().await.map_err(network_error)?;
             ctx.check()?;
@@ -392,7 +433,7 @@ impl Fetcher {
             if last && expected_length.is_some_and(|length| length != downloaded as u64) {
                 return Err(Error::new(
                     ErrorCode::UpstreamFailed,
-                    "Upstream closed an incomplete HTML response",
+                    "Upstream closed an incomplete response",
                 ));
             }
             let mut input = chunk.as_deref().unwrap_or_default();
@@ -411,12 +452,12 @@ impl Fetcher {
                     continue;
                 }
                 let mut selected =
-                    html_encoding(&prefix[..prefix_len], encoding, ctx)?.new_decoder();
+                    text_encoding(&prefix[..prefix_len], encoding, kind, ctx)?.new_decoder();
                 decode(
                     &mut selected,
                     &prefix[..prefix_len],
                     false,
-                    &mut html,
+                    &mut text,
                     limits,
                     ctx,
                 )?;
@@ -424,20 +465,20 @@ impl Fetcher {
             }
             let decoder = decoder.as_mut().unwrap();
             for input in input.chunks(8192) {
-                decode(decoder, input, false, &mut html, limits, ctx)?;
+                decode(decoder, input, false, &mut text, limits, ctx)?;
             }
             if last {
-                decode(decoder, &[], true, &mut html, limits, ctx)?;
+                decode(decoder, &[], true, &mut text, limits, ctx)?;
                 break;
             }
         }
-        if html.trim().is_empty() {
+        if text.trim().is_empty() {
             return Err(Error::new(
                 ErrorCode::UnsupportedContent,
-                "Upstream returned an empty HTML page",
+                "Upstream returned an empty page",
             ));
         }
-        Ok(html)
+        Ok(text)
     }
 }
 
@@ -492,15 +533,16 @@ fn check_status(response: &Response) -> Result<(), Error> {
     Err(error)
 }
 
-#[cfg(test)]
-fn response_encoding(response: &Response) -> Result<Option<&'static Encoding>, Error> {
-    response_encoding_for(response, false)
-}
-
-fn response_encoding_for(
+fn response_kind_for(
     response: &Response,
-    script: bool,
-) -> Result<Option<&'static Encoding>, Error> {
+    provider: Option<bool>,
+) -> Result<(PageKind, Option<&'static Encoding>), Error> {
+    let script = provider == Some(true);
+    let unsupported = match provider {
+        None => "Only HTML, XHTML, plain text, markdown, and JSON pages are supported",
+        Some(true) => "Provider script responses must be HTML, XHTML, JSON, or JavaScript",
+        Some(false) => "Provider website responses must be HTML or XHTML",
+    };
     for header in response.headers().get_all(CONTENT_ENCODING) {
         let value = header.to_str().map_err(|_| unsupported_encoding())?;
         if value
@@ -518,7 +560,7 @@ fn response_encoding_for(
         .ok_or_else(|| {
             Error::new(
                 ErrorCode::UnsupportedContent,
-                "Page must declare an HTML Content-Type",
+                "Page must declare a Content-Type",
             )
         })?;
     if types.next().is_some() {
@@ -528,22 +570,32 @@ fn response_encoding_for(
         ));
     }
     let mut parts = content_type.split(';');
-    if !parts.next().is_some_and(|kind| {
-        let kind = kind.trim().to_ascii_lowercase();
-        matches!(kind.as_str(), "text/html" | "application/xhtml+xml")
-            || (script
-                && matches!(
-                    kind.as_str(),
-                    "application/json"
-                        | "application/javascript"
-                        | "text/javascript"
-                        | "application/x-javascript"
-                ))
-    }) {
-        return Err(Error::new(
-            ErrorCode::UnsupportedContent,
-            "Only HTML and XHTML pages are supported",
-        ));
+    let kind = parts
+        .next()
+        .and_then(|kind| {
+            let kind = kind.trim().to_ascii_lowercase();
+            match kind.as_str() {
+                "text/html" | "application/xhtml+xml" => Some(PageKind::Html),
+                "application/json" => Some(PageKind::Plain),
+                "text/plain" | "text/markdown" | "text/x-markdown" if !script => {
+                    Some(PageKind::Plain)
+                }
+                "application/javascript" | "text/javascript" | "application/x-javascript"
+                    if script =>
+                {
+                    Some(PageKind::Plain)
+                }
+                _ => None,
+            }
+        })
+        .ok_or_else(|| Error::new(ErrorCode::UnsupportedContent, unsupported))?;
+    if provider.is_some()
+        && !match kind {
+            PageKind::Html => true,
+            PageKind::Plain => script,
+        }
+    {
+        return Err(Error::new(ErrorCode::UnsupportedContent, unsupported));
     }
     let mut encoding = None;
     for part in parts {
@@ -573,12 +625,13 @@ fn response_encoding_for(
             );
         }
     }
-    Ok(encoding)
+    Ok((kind, encoding))
 }
 
-fn html_encoding(
+fn text_encoding(
     prefix: &[u8],
     encoding: Option<&'static Encoding>,
+    kind: PageKind,
     ctx: &RequestContext,
 ) -> Result<&'static Encoding, Error> {
     let prefix = &prefix[..prefix.len().min(MAX_CHARSET_SNIFF_BYTES)];
@@ -587,6 +640,9 @@ fn html_encoding(
     }
     if let Some(encoding) = encoding {
         return Ok(encoding);
+    }
+    if kind == PageKind::Plain {
+        return Ok(UTF_8);
     }
     let mut emitter = DefaultEmitter::default();
     emitter.naively_switch_states(true);
@@ -663,7 +719,7 @@ fn decode(
             .checked_add(written)
             .filter(|size| *size <= limits.max_decoded_bytes)
             .ok_or_else(|| {
-                Error::new(ErrorCode::TooLarge, "Decoded HTML exceeds the byte limit")
+                Error::new(ErrorCode::TooLarge, "Decoded page exceeds the byte limit")
             })?;
         if required > html.capacity() {
             let capacity = html
@@ -674,7 +730,7 @@ fn decode(
             html.try_reserve_exact(capacity - html.len()).map_err(|_| {
                 Error::new(
                     ErrorCode::Overloaded,
-                    "Cannot allocate memory for decoded HTML",
+                    "Cannot allocate memory for decoded page",
                 )
             })?;
         }
@@ -710,7 +766,7 @@ fn network_error(error: reqwest::Error) -> Error {
 fn download_too_large() -> Error {
     Error::new(
         ErrorCode::TooLarge,
-        "Downloaded HTML exceeds the byte limit",
+        "Downloaded page exceeds the byte limit",
     )
 }
 

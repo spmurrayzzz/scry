@@ -61,10 +61,10 @@ async fn wire_requests_preserve_pinned_host_and_scoped_provider_headers() {
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.content_length(), Some(11));
-        let encoding = response_encoding(&response).unwrap();
+        let (kind, encoding) = response_kind_for(&response, None).unwrap();
         assert_eq!(
             fetcher(limits.clone())
-                .read_html(response, encoding, &ctx)
+                .read_text(response, kind, encoding, &ctx)
                 .await
                 .unwrap(),
             "<p>test</p>"
@@ -151,9 +151,12 @@ async fn ordinary_client_does_not_select_provider_headers_from_a_duckduckgo_host
             .send()
             .await
             .unwrap();
-        let encoding = response_encoding_for(&response, false).unwrap();
+        let (kind, encoding) = response_kind_for(&response, None).unwrap();
         assert_eq!(
-            fetcher.read_html(response, encoding, &ctx).await.unwrap(),
+            fetcher
+                .read_text(response, kind, encoding, &ctx)
+                .await
+                .unwrap(),
             "<p>page</p>"
         );
         let request = server.finish().await;
@@ -298,8 +301,12 @@ async fn provider_bodies_keep_download_decoding_and_encoding_limits() {
             };
             let (response, mut server, ctx) =
                 provider_response("200 OK", headers, chunked, &chunks, &limits).await;
-            let result = match response_encoding(&response) {
-                Ok(encoding) => fetcher(limits).read_html(response, encoding, &ctx).await,
+            let result = match response_kind_for(&response, None) {
+                Ok((kind, encoding)) => {
+                    fetcher(limits)
+                        .read_text(response, kind, encoding, &ctx)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             match expected {
@@ -334,11 +341,11 @@ async fn provider_body_timeout_keeps_its_timeout_classification() {
     )
     .await
     .unwrap();
-    let encoding = response_encoding(&response).unwrap();
+    let (kind, encoding) = response_kind_for(&response, None).unwrap();
     let body_ctx = RequestContext::new(Duration::from_secs(30));
     let fetcher = fetcher(limits);
     tokio::time::pause();
-    let mut reading = Box::pin(fetcher.read_html(response, encoding, &body_ctx));
+    let mut reading = Box::pin(fetcher.read_text(response, kind, encoding, &body_ctx));
     assert!(futures_util::poll!(reading.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(2)).await;
     assert_eq!(reading.await.unwrap_err().code, ErrorCode::Timeout);
@@ -414,12 +421,12 @@ async fn decoder_rejects_eof_with_declared_bytes_still_missing() {
                 .unwrap(),
         );
         assert_eq!(response.content_length(), Some(5));
-        let encoding = response_encoding_for(&response, script).unwrap();
+        let (kind, encoding) = response_kind_for(&response, Some(script)).unwrap();
         let error = fetcher(Limits::default())
-            .read_html(response, encoding, &RequestContext::new(BUDGET))
+            .read_text(response, kind, encoding, &RequestContext::new(BUDGET))
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::UpstreamFailed);
-        assert_eq!(error.message, "Upstream closed an incomplete HTML response");
+        assert_eq!(error.message, "Upstream closed an incomplete response");
     }
 }

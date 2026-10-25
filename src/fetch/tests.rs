@@ -164,8 +164,8 @@ async fn body_decoder(
     let fetcher = fetcher(limits);
     let (response, mut server, ctx) = response(&fetcher, "200 OK", headers, chunked, chunks).await;
     assert_eq!(response.content_length(), None);
-    let result = match response_encoding(&response) {
-        Ok(encoding) => timeout(BUDGET, fetcher.read_html(response, encoding, &ctx))
+    let result = match response_kind_for(&response, None) {
+        Ok((kind, encoding)) => timeout(BUDGET, fetcher.read_text(response, kind, encoding, &ctx))
             .await
             .expect("Body decoder exceeded its budget"),
         Err(error) => Err(error),
@@ -201,7 +201,7 @@ async fn body_decoder_bounds_chunked_and_close_delimited_downloads() {
         .await
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::TooLarge);
-        assert_eq!(error.message, "Downloaded HTML exceeds the byte limit");
+        assert_eq!(error.message, "Downloaded page exceeds the byte limit");
     }
 }
 
@@ -224,7 +224,7 @@ async fn body_decoder_bounds_decoded_utf8_bytes_at_exact_boundary() {
             Err(code) => {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, code);
-                assert_eq!(error.message, "Decoded HTML exceeds the byte limit");
+                assert_eq!(error.message, "Decoded page exceeds the byte limit");
             }
         }
     }
@@ -305,8 +305,8 @@ async fn body_decoder_keeps_charset_state_across_chunks_after_sniff_prefix() {
 async fn body_decoder_rejects_unsupported_mime_charset_and_content_encoding() {
     for headers in [
         "",
-        "Content-Type: text/plain\r\n",
         "Content-Type: application/pdf\r\n",
+        "Content-Type: application/octet-stream\r\n",
         "Content-Type: text/html; charset=not-a-charset\r\n",
         "Content-Type: text/html; charset=replacement\r\n",
         "Content-Type: text/html; charset=utf-8; charset=windows-1252\r\n",
@@ -330,6 +330,46 @@ async fn body_decoder_rejects_unsupported_mime_charset_and_content_encoding() {
         .await
         .unwrap(),
         "<p>x</p>"
+    );
+}
+
+#[tokio::test]
+async fn body_decoder_accepts_plain_text_markdown_and_json_types() {
+    for kind in [
+        "text/plain",
+        "text/markdown",
+        "text/x-markdown",
+        "application/json",
+    ] {
+        let headers = format!("Content-Type: {kind}\r\n");
+        assert_eq!(
+            body_decoder(Limits::default(), &headers, false, &[b"# hello"])
+                .await
+                .unwrap(),
+            "# hello"
+        );
+    }
+    assert_eq!(
+        body_decoder(
+            Limits::default(),
+            "Content-Type: text/plain; charset=windows-1252\r\n",
+            false,
+            &[b"\x80"],
+        )
+        .await
+        .unwrap(),
+        "\u{20ac}"
+    );
+    assert_eq!(
+        body_decoder(
+            Limits::default(),
+            "Content-Type: text/plain\r\n",
+            false,
+            &[b"<meta charset=windows-1252>\x80"],
+        )
+        .await
+        .unwrap(),
+        "<meta charset=windows-1252>\u{fffd}"
     );
 }
 

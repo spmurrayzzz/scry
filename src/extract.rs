@@ -1273,6 +1273,45 @@ fn blocked_screen(doc: &Document, root: usize, ctx: &RequestContext) -> Result<b
     Ok(false)
 }
 
+pub(crate) fn extract_plain(
+    text: &str,
+    query: Option<&str>,
+    ctx: &RequestContext,
+    limits: &Limits,
+) -> Result<ExtractedPage, Error> {
+    ctx.check()?;
+    if text.len() > limits.max_decoded_bytes {
+        return Err(too_large("Decoded page exceeds the byte limit"));
+    }
+    if text.trim().is_empty() {
+        return Err(Error::new(
+            ErrorCode::ExtractionFailed,
+            "Page has no readable content",
+        ));
+    }
+    let highlights = highlights(
+        text,
+        query,
+        (limits.max_text_chars / 4).min(900),
+        ctx,
+        limits,
+    )?;
+    let used: usize = highlights
+        .iter()
+        .map(|highlight| highlight.chars().count())
+        .sum();
+    let cap = limits.max_text_chars.saturating_sub(used);
+    let count = text.chars().count();
+    let out = text.chars().take(cap).collect::<String>();
+    ctx.check()?;
+    Ok(ExtractedPage {
+        title: None,
+        text: out,
+        highlights,
+        truncated: count > cap,
+    })
+}
+
 pub(crate) fn extract(
     html: &str,
     base: &Url,

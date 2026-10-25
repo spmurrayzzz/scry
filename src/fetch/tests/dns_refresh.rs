@@ -37,7 +37,7 @@ async fn fetch_addresses(fetcher: &Fetcher, url: &str) -> Result<Vec<SocketAddr>
     .expect("Fetch exceeded its budget");
     match result {
         Ok(page) => {
-            assert_eq!(page.html, "<p>local response</p>");
+            assert_eq!(page.as_text(), Some("<p>local response</p>"));
             Ok(sent.unwrap())
         }
         Err(error) => {
