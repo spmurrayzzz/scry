@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 #[command(
     name = "scry",
     version,
-    about = "Search the web and read public HTML pages",
+    about = "Search the web and read public HTML pages, plain text, markdown, JSON, and PDF documents",
     after_help = "Output: plain text by default. Use --json for structured results and operation errors. Argument errors use plain text on stderr. Exit codes: 0 success, 1 failure (including all URLs failed), 2 partial results or invalid/unsupported arguments, 130 interrupted. DuckDuckGo access is unofficial and can fail or be blocked."
 )]
 struct Cli {
@@ -41,7 +41,9 @@ struct Cli {
 enum Command {
     #[command(about = "Search DuckDuckGo; auto and keyword use ordinary keyword search")]
     Search(SearchArgs),
-    #[command(about = "Read public URLs directly; IDs must also be source URLs")]
+    #[command(
+        about = "Read public URLs directly; HTML, plain text, markdown, JSON, and PDF are accepted; PDF extraction needs a text layer; IDs must also be source URLs"
+    )]
     Contents(ContentsArgs),
     #[command(
         about = "Serve REST and session-based Streamable HTTP MCP",
