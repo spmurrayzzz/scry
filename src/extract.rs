@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 
-use html5gum::{DefaultEmitter, Reader, State, Token, Tokenizer};
+use html5gum::{DefaultEmitter, Emitter, ForwardingEmitter, Reader, State, Token, Tokenizer};
 use url::Url;
 
 use crate::api::{Error, ErrorCode};
@@ -150,15 +150,54 @@ const MAX_TOKEN_BYTES: usize = 65536;
 const MAX_ATTRIBUTE_BYTES: usize = 16384;
 const MAX_ATTRIBUTES: usize = 256;
 
+struct PageEmitter<'a> {
+    inner: DefaultEmitter,
+    discard_text: &'a Cell<bool>,
+    consumed: &'a Cell<usize>,
+    count: &'a Cell<usize>,
+}
+
+impl ForwardingEmitter for PageEmitter<'_> {
+    type Token = Token;
+
+    fn inner(&mut self) -> &mut impl Emitter<Token = Self::Token> {
+        &mut self.inner
+    }
+
+    fn emit_string(&mut self, text: &[u8]) {
+        if self.discard_text.get() {
+            if !matches!(text, [byte] if byte.is_ascii_alphabetic()) {
+                self.consumed.set(1);
+            }
+        } else {
+            Emitter::emit_string(&mut self.inner, text);
+        }
+    }
+
+    fn emit_error(&mut self, error: html5gum::Error) {
+        if self.discard_text.get() {
+            self.count.set(self.count.get().saturating_add(1));
+        } else {
+            Emitter::emit_error(&mut self.inner, error);
+        }
+    }
+}
+
 struct CheckedReader<'a> {
     input: &'a [u8],
     ctx: &'a RequestContext,
     consumed: &'a Cell<usize>,
+    count: &'a Cell<usize>,
+    max_tokens: usize,
     unchecked: usize,
 }
 
 impl CheckedReader<'_> {
     fn charge(&mut self, bytes: usize) -> Result<(), Error> {
+        if self.count.get() > self.max_tokens {
+            self.ctx.check()?;
+            return Err(too_large("HTML exceeds the token limit"));
+        }
         if self.unchecked + bytes >= READ_INTERVAL {
             self.ctx.check()?;
             self.unchecked = 0;
@@ -311,13 +350,23 @@ pub(crate) fn parse(html: &str, ctx: &RequestContext, limits: &Limits) -> Result
     if html.len() > limits.max_decoded_bytes {
         return Err(too_large("Decoded HTML exceeds the byte limit"));
     }
-    let mut emitter = DefaultEmitter::default();
-    emitter.naively_switch_states(true);
+    let mut inner = DefaultEmitter::default();
+    inner.naively_switch_states(true);
     let consumed = Cell::new(0);
+    let count = Cell::new(0);
+    let discard_text = Cell::new(false);
+    let emitter = PageEmitter {
+        inner,
+        discard_text: &discard_text,
+        consumed: &consumed,
+        count: &count,
+    };
     let reader = CheckedReader {
         input: html.as_bytes(),
         ctx,
         consumed: &consumed,
+        count: &count,
+        max_tokens: limits.max_html_tokens,
         unchecked: 0,
     };
     let mut tokenizer = Tokenizer::new_with_emitter(reader, emitter);
@@ -331,13 +380,12 @@ pub(crate) fn parse(html: &str, ctx: &RequestContext, limits: &Limits) -> Result
     }];
     let mut stack = vec![0];
     let mut open: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut count = 0;
     while let Some(token) = tokenizer.next() {
         ctx.check()?;
-        if count >= limits.max_html_tokens {
+        if count.get() >= limits.max_html_tokens {
             return Err(too_large("HTML exceeds the token limit"));
         }
-        count += 1;
+        count.set(count.get() + 1);
         let token = token?;
         if !matches!(token, Token::Error(_)) {
             consumed.set(0);
@@ -506,12 +554,19 @@ pub(crate) fn parse(html: &str, ctx: &RequestContext, limits: &Limits) -> Result
             }
             _ => {}
         }
+        discard_text.set(matches!(
+            nodes[*stack.last().unwrap()].tag.as_str(),
+            "script" | "style"
+        ));
     }
     for index in stack {
         ctx.check()?;
         nodes[index].end = nodes.len();
     }
     ctx.check()?;
+    if count.get() > limits.max_html_tokens {
+        return Err(too_large("HTML exceeds the token limit"));
+    }
     Ok(Document { nodes })
 }
 

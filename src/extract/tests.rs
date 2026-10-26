@@ -456,10 +456,13 @@ fn cooperative_reader_observes_cancellation_after_reading_begins() {
     let ctx = context();
     let input = vec![b'x'; 8192];
     let consumed = Cell::new(0);
+    let count = Cell::new(0);
     let mut reader = CheckedReader {
         input: &input,
         ctx: &ctx,
         consumed: &consumed,
+        count: &count,
+        max_tokens: Limits::default().max_html_tokens,
         unchecked: 0,
     };
     assert_eq!(reader.read_byte().unwrap(), Some(b'x'));
