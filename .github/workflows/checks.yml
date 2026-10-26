@@ -31,5 +31,14 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
 
+      - name: Install PDFium
+        run: |
+          curl -fsSL -o /tmp/pdfium.tgz https://github.com/run-llama/pdfium-binaries/releases/download/chromium%2F8058/pdfium-linux-x64.tgz
+          rm -rf pdfium
+          mkdir pdfium
+          tar -xzf /tmp/pdfium.tgz -C pdfium
+          echo "PDFIUM_LIB_PATH=$PWD/pdfium/lib" >> "$GITHUB_ENV"
+          echo "PDFIUM_INCLUDE_PATH=$PWD/pdfium/include" >> "$GITHUB_ENV"
+
       - name: Run checks and tests
         run: make check
